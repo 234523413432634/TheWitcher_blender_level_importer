@@ -30,7 +30,7 @@ It imports:
 3. Doors (both interactable and non-interactable)
 4. Skybox with clouds and sun/moon depending on the selected time of day (a bit wonky, but nothing that can't be fixed manually in a few seconds)
 
-Setup:
+## Setup:
 1. Download both plugins and install them as blender addons
 2. Download [Spt2Fbx](https://github.com/VenoMKO/Spt2Fbx/releases/),  put "SpeedTreeRT.dll" and "Spt2Fbx.exe" from the archive into your blender folder (where blender.exe is). Just leave them here.
 3. UnBIF your game installation (I use and recommend [RedTools](https://github.com/JLouis-B/RedTools/releases)). The addons expect the unpacked directory to look like this:
