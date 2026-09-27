@@ -1,10 +1,10 @@
 bl_info = {
     "name": "The Witcher 1 MDB Importer",
     "author": "Angry Catster",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (5, 0, 1),
-    "location": "File > Import > Witcher MDB (.mdb)",
-    "description": "Import The Witcher 1 .mdb model files",
+    "location": "File > Import > Witcher MDB (.mdb) / Witcher Animation (.mba)",
+    "description": "Import The Witcher 1 .mdb model files and .mba animation packs",
     "category": "Import-Export",
 }
 
@@ -16,6 +16,7 @@ import traceback
 import math
 import subprocess
 import re
+import bisect
 from mathutils import Vector, Matrix, Quaternion
 from collections import defaultdict
 from bpy_extras.io_utils import ImportHelper
@@ -25,6 +26,7 @@ from bpy.types import Operator
 # Node Types
 NODE_TYPE_NODE = 0x00000001
 NODE_TYPE_LIGHT = 0x00000003
+NODE_TYPE_EMITTER = 0x00000005
 NODE_TYPE_TRIMESH = 0x00000021
 NODE_TYPE_SKIN = 0x00000061
 NODE_TYPE_TEXTURE_PAINT = 0x00008001
@@ -37,14 +39,556 @@ CONTROLLER_SCALE = 184
 CONTROLLER_SELF_ILLUM_COLOR = 276
 CONTROLLER_ALPHA = 292
 
+# Column count is the low nibble of this byte; the high nibble says how many
+# value sets each row carries, of which only the first is the value.
+CONTROLLER_COLUMN_MASK = 0x0F
+CONTROLLER_ROW_SETS = {0x00: 1, 0x10: 3, 0x20: 4, 0x40: 2}
+
+# The rate the packs were authored at.
+ANIMATION_FPS = 30.0
+ANIMATION_FRAME_SNAP = 0.02
+ANIMATION_LOOP_TOLERANCE = 1e-3
+
 # File versions
 FILE_VERSION_133 = 133
 FILE_VERSION_136 = 136
 
+# Custom properties written on armature bones by the MDB importer. They hold the
+# rest transforms of the MDB node a bone came from, which the MBA animation
+# importer needs to map node-space animation onto Blender's own bone rest frames.
+REST_LOCAL_PROP = "tw1_rest_local"
+REST_GLOBAL_PROP = "tw1_rest_global"
+
+
+class CompositeModel:
+    """A 'binarycompositemodel' - a plain-text stub naming a real model."""
+
+    def __init__(self):
+        self.name = ""
+        self.base_model = ""
+        self.animation_sets = []
+
+
+def read_composite_model(filepath):
+    """Return a CompositeModel for a composite stub, or None for a real model."""
+    try:
+        with open(filepath, 'rb') as handle:
+            head = handle.read(4096)
+    except OSError:
+        return None
+
+    if not head[:1] or head[:1] == b'\0':
+        return None
+    text = head.split(b'\0')[0].decode('latin-1', 'replace')
+    if not text.lstrip().startswith("binarycompositemodel"):
+        return None
+
+    composite = CompositeModel()
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "binarycompositemodel":
+            composite.name = parts[1] if len(parts) > 1 else ""
+            composite.base_model = parts[2] if len(parts) > 2 else ""
+        elif parts[0] == "animationset" and len(parts) > 1:
+            composite.animation_sets.append(parts[1])
+        elif parts[0] == "donecompositemodel":
+            break
+    return composite if composite.base_model else None
+
+
+def find_sibling_model(filepath, model_name):
+    """Locate the .mdb a composite model refers to, next to the composite."""
+    if not model_name or model_name.upper() == "NULL":
+        return None
+    folder = os.path.dirname(filepath)
+    candidate = os.path.join(folder, model_name + ".mdb")
+    if os.path.exists(candidate):
+        return candidate
+    # Fall back to a case-insensitive match; the game's own paths are sloppy.
+    target = (model_name + ".mdb").lower()
+    try:
+        for entry in os.listdir(folder):
+            if entry.lower() == target:
+                return os.path.join(folder, entry)
+    except OSError:
+        pass
+    return None
+
+
+# The render pass the game sorts a node into. It settles blending only -
+# alpha-tested geometry still rides in the opaque pass.
+RENDER_PASS_BLENDED = frozenset(("TRSP", "SKY_", "SCRN", "FLAR", "CRNS", "TRUG"))
+
+# The sky's sun and moon. Every skybox in the game names them this way -
+# _sky_sun and _sky_moon, 21 nodes between them - and they are the only sky
+# elements that sit inside the shells rather than enclosing the viewer.
+CELESTIAL_NODE_PREFIX = "_sky_"
+
+# The sky's weather layer, which the game only fades in when the weather turns.
+WEATHER_CLOUD_SHADERS = frozenset(("clouds_weather",))
+WEATHER_OVERLAY_PROP = "tw1_weather_overlay"
+
+# Passes drawn over the finished scene: overlays, never depth writers. SKY_ is
+# deliberately not one of them.
+RENDER_PASS_EFFECT_LAYERS = frozenset(("SCRN", "FLAR", "CRNS", "TRUG"))
+
+
+def render_pass_tag(mesh_data):
+    """The node's four-character render pass tag, or None if it has none."""
+    value = mesh_data.get('render_pass')
+    if value is None:
+        return None
+    try:
+        tag = struct.pack("<I", value & 0xFFFFFFFF).decode('ascii')
+    except (struct.error, UnicodeDecodeError):
+        return None
+    return tag if tag.isprintable() else None
+
+
+# Shaders whose name says outright that they draw something see-through.
+# A floor, not a verdict: a texture that measures as coverage gets it anyway.
+SHADERS_DECLARING_TRANSPARENCY = frozenset((
+    "transparency_2p", "transparency_2ps", "trans_cds_2p",
+    "skin_all_trans", "norm_all_trans", "alphamask", "dblsided_atest",
+    "leaves", "leaves_lm", "leaves_lm_bill", "leaves_singles", "plant", "hair",
+    "envmap_alpha", "additive_alpha", "additive_alphaz",
+    "dadd_alpha_mul", "dadd_al_mul_alp",
+))
+
+# The window shaders. Their alpha is a light mask, not coverage, and the game
+# lights those panes at night.
+WINDOW_GLOW_SHADERS = frozenset(("envmapping_lm_b", "envmap_lm_b_sic"))
+
+# Lit when the level's own lighting is, which is what the time of day selects.
+WINDOW_GLOW_TIMES = frozenset(("NIGHT", "MORNING"))
+
+# Lamplight - the one number here the files do not supply.
+WINDOW_GLOW_COLOR = (1.0, 0.73, 0.36)
+WINDOW_GLOW_STRENGTH = 2.0
+
+
+def window_glow_applies(mesh_data, time_of_day):
+    """True when this node is a window that should be lit from inside."""
+    return ((mesh_data.get('shader_type') or '') in WINDOW_GLOW_SHADERS
+            and time_of_day in WINDOW_GLOW_TIMES)
+
+
+# Shaders painted on a closed surface, which is not four-fifths holes, so their
+# alpha needs a higher bar before it reads as coverage.
+SOLID_SURFACE_SHADERS = frozenset((
+    "specular",
+    "envmapping", "envmapping_lm", "envmapping_lm_b", "envmap_s",
+    "envmap_lm_b_sic", "envmap_lmtp", "envmap_lmtp_b",
+    "envadd", "envadd_lm", "envadd_lm_b", "envadd_lmtp", "envadd_lmtp_b",
+    "normalmap_env", "norm_env_rim_ao", "norm_env_rim_l", "skin_nrimaoenv",
+    "selfilum", "selfilum_b", "normalmap_selfil", "normalmap_glow", "skin_n_glow",
+    "skin_n", "skin_n_rim_ao", "skin_n_rim_ao_mh", "skin_n_rim_ao_md",
+    "reflection", "reflection_b", "simple_refl",
+    "texture_blend", "texture_blend_2p",
+    "noalphatest",
+))
+
+
+# When neither the pass nor the shader settles it, the texture does: a cut-out's
+# alpha is a stencil, a mask is a ramp.
+COVERAGE_MIN_EXTREME_FRACTION = 0.7
+# ...and enough of the surface has to actually draw, measured above 0.4 rather
+# than at full opacity.
+COVERAGE_MIN_PRESENT_FRACTION = 0.02
+COVERAGE_MIN_PRESENT_ON_SURFACE = 0.5
+# A cut-out needs holes as well as substance: window masks have none.
+COVERAGE_MIN_EMPTY_FRACTION = 0.01
+
+_alpha_coverage_cache = {}
+
+
+def texture_alpha_is_coverage(image, solid_surface=False):
+    """True when a texture's alpha reads as a cut-out rather than a mask."""
+    if image is None or image.channels < 4:
+        return False
+
+    key = (image.filepath_raw or image.filepath or image.name, solid_surface)
+    cached = _alpha_coverage_cache.get(key)
+    if cached is not None:
+        return cached
+
+    result = True
+    try:
+        import numpy
+        width, height = image.size
+        buf = numpy.empty(width * height * image.channels, dtype=numpy.float32)
+        image.pixels.foreach_get(buf)
+        alpha = buf.reshape(-1, image.channels)[:, 3]
+        empty = float((alpha < 0.04).mean())
+        solid = float((alpha > 0.9).mean())
+        present = float((alpha > 0.4).mean())
+        floor = (COVERAGE_MIN_PRESENT_ON_SURFACE if solid_surface
+                 else COVERAGE_MIN_PRESENT_FRACTION)
+        result = (empty + solid >= COVERAGE_MIN_EXTREME_FRACTION
+                  and present >= floor
+                  and empty >= COVERAGE_MIN_EMPTY_FRACTION)
+    except Exception as e:
+        logger.log(f"  Could not read alpha of {key}: {e}")
+        return True
+
+    _alpha_coverage_cache[key] = result
+    return result
+
+
+# Materials built by the import that is running. Cleared at the start of every
+# import: they are shared within one import and never across two.
+_import_materials = {}
+
+_alpha_trivial_cache = {}
+
+
+def texture_alpha_is_trivial(image):
+    """True when a texture's alpha is solid everywhere, so nothing can blend."""
+    if image is None:
+        return True
+    if image.channels < 4:
+        return True
+
+    key = image.filepath_raw or image.filepath or image.name
+    cached = _alpha_trivial_cache.get(key)
+    if cached is not None:
+        return cached
+
+    result = False
+    try:
+        import numpy
+        width, height = image.size
+        buf = numpy.empty(width * height * image.channels, dtype=numpy.float32)
+        image.pixels.foreach_get(buf)
+        alpha = buf.reshape(-1, image.channels)[:, 3]
+        result = bool((alpha > 0.99).all())
+    except Exception as e:
+        logger.log(f"  Could not read alpha of {key}: {e}")
+        return False
+
+    _alpha_trivial_cache[key] = result
+    return result
+
+
+ALPHA_OPAQUE = 'OPAQUE'
+ALPHA_CLIP = 'CLIP'
+ALPHA_BLEND = 'BLEND'
+# Clip, but only once the diffuse texture has been seen and its alpha turns out
+# to be a cut-out rather than a mask.
+ALPHA_CLIP_IF_COVERAGE = 'CLIP_IF_COVERAGE'
+
+
+def resolve_alpha_mode(mesh_data):
+    """Decide how one mesh node should treat its diffuse alpha."""
+    if render_pass_tag(mesh_data) in RENDER_PASS_BLENDED:
+        return ALPHA_BLEND
+
+    alpha = mesh_data.get('alpha')
+    if alpha is not None and alpha < 1.0:
+        return ALPHA_BLEND
+    if mesh_data.get('transparency_hint') or mesh_data.get('is_transparent'):
+        return ALPHA_BLEND
+
+    if (mesh_data.get('shader_type') or '') in SHADERS_DECLARING_TRANSPARENCY:
+        return ALPHA_CLIP
+    return ALPHA_CLIP_IF_COVERAGE
+
+
+def resolve_deferred_alpha_mode(mode, image, mesh_data=None):
+    """Settle CLIP_IF_COVERAGE now that the diffuse texture is loaded."""
+    if mode != ALPHA_CLIP_IF_COVERAGE:
+        return mode
+    solid = (mesh_data or {}).get('shader_type') in SOLID_SURFACE_SHADERS
+    return ALPHA_CLIP if texture_alpha_is_coverage(image, solid) else ALPHA_OPAQUE
+
+
+def apply_alpha_mode(mat, bsdf, mode, alpha_value=1.0):
+    """Set up a material for the alpha mode, before anything is linked in."""
+    if mode == ALPHA_CLIP_IF_COVERAGE:
+        mode = ALPHA_CLIP
+    if mode == ALPHA_BLEND:
+        mat.blend_method = 'BLEND'
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+        bsdf.inputs['Alpha'].default_value = alpha_value
+    elif mode == ALPHA_CLIP:
+        mat.blend_method = 'CLIP'
+        if hasattr(mat, 'alpha_threshold'):
+            mat.alpha_threshold = 0.5
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'DITHERED'
+    else:
+        mat.blend_method = 'OPAQUE'
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'DITHERED'
+
+
+def link_texture_alpha(links, nodes, tex_node, bsdf, mode, alpha_value=1.0,
+                       mesh_data=None):
+    """Feed a texture's alpha into the shader for the modes that want it."""
+    image = tex_node.image
+    if image is None or image.channels < 4:
+        return False
+    if resolve_deferred_alpha_mode(mode, image, mesh_data) == ALPHA_OPAQUE:
+        return False
+
+    source = tex_node.outputs['Alpha']
+    if alpha_value < 1.0:
+        # The node's own alpha controller scales the texture's alpha rather than being
+        # replaced by it.
+        scale = nodes.new('ShaderNodeMath')
+        scale.location = (tex_node.location.x + 220, tex_node.location.y - 160)
+        scale.operation = 'MULTIPLY'
+        scale.label = "Node Alpha"
+        scale.inputs[1].default_value = alpha_value
+        links.new(source, scale.inputs[0])
+        source = scale.outputs['Value']
+
+    links.new(source, bsdf.inputs['Alpha'])
+    return True
+
+
+def fill_unpainted_weights(mesh, layer_weights):
+    """Spread paint into vertices that no surviving layer covers.
+
+    layer_weights is one list of per-vertex weights per surviving layer, edited
+    in place. Returns the number of vertices that had to be filled.
+    """
+    if not layer_weights:
+        return 0
+
+    vertex_count = len(layer_weights[0])
+    painted = [sum(w[v] for w in layer_weights) > 1e-4 for v in range(vertex_count)]
+    missing = [v for v in range(vertex_count) if not painted[v]]
+    if not missing or len(missing) == vertex_count:
+        return 0
+
+    neighbours = [[] for _ in range(vertex_count)]
+    for edge in mesh.edges:
+        a, b = edge.vertices
+        if a < vertex_count and b < vertex_count:
+            neighbours[a].append(b)
+            neighbours[b].append(a)
+
+    filled = 0
+    frontier = list(missing)
+    while frontier:
+        resolved = []
+        for v in frontier:
+            sources = [n for n in neighbours[v] if painted[n]]
+            if not sources:
+                continue
+            for w in layer_weights:
+                w[v] = sum(w[n] for n in sources) / len(sources)
+            resolved.append(v)
+        if not resolved:
+            break
+        for v in resolved:
+            painted[v] = True
+            filled += 1
+        frontier = [v for v in frontier if not painted[v]]
+
+    return filled
+
+
+def texture_paint_layers(mesh_data, importer):
+    """Layers that own a texture, in the order their weight channels are packed."""
+    vertex_count = len(mesh_data.get('vertices') or ())
+    return [(i, layer) for i, layer in enumerate(mesh_data.get('layers') or ())
+            if layer.get('texture') and layer.get('weights')
+            and len(layer['weights']) == vertex_count
+            and importer.find_texture_file(layer['texture'])]
+
+
+def matrix_to_list(matrix):
+    return [c for row in matrix for c in row]
+
+
+def list_to_matrix(values):
+    return Matrix([tuple(values[i * 4:i * 4 + 4]) for i in range(4)])
+
 # Arbitrary scale multiplier for tree meshes
 TREE_SCALE_MULTIPLIER = 32.0
 
-DEFAULT_MATERIAL_ALPHA = 0.2
+# Texture keys that name the surface's own colour map, and the slot each belongs
+# in. A list of what to take, not what to skip.
+DIFFUSE_TEXTURE_KEYS = {
+    "texture0": 0, "texture1": 1, "texture2": 2, "texture3": 3,
+    "tex": 0, "texture_layer0": 0,
+    "diff_texture": 0, "diffuse_texture": 0, "diffuse_map": 0,
+    "main_texture": 0, "mainTexture": 0, "leaves_texture": 0,
+}
+
+# Meshes whose texture could not be resolved are left faint rather than drawn as
+# solid white blocks in front of everything else.
+UNTEXTURED_MATERIAL_ALPHA = 0.2
+
+# Shaders whose name says the surface is drawn from both sides. No mesh in the
+# game carries its own back faces.
+DOUBLE_SIDED_SHADERS = frozenset(("dblsided_atest", "double_sided"))
+
+# Shaders that add what they draw to the scene instead of covering it. The
+# "dadd" family modulates the first stage with a second.
+ADDITIVE_SHADERS = frozenset((
+    "additive", "additive_alpha", "additive_alphaz",
+    "dadd_alpha_mul", "dadd_al_mul_alp", "double_add", "decal_additive",
+    # A lens flare: both corona textures are black but for a bright core, with
+    # alpha 1 from edge to edge. Blended, that is a black square over the sun.
+    "corona",
+))
+
+
+def resolve_lightmap_name(lightmap_texture, light_map_name, valid_textures):
+    """Which of a node's textures is its lightmap, by name."""
+    if lightmap_texture and lightmap_texture in valid_textures:
+        return lightmap_texture
+    if light_map_name and light_map_name in valid_textures:
+        return light_map_name
+    return None
+
+
+def uv_slot_for(t_verts_defs, stage):
+    """The UV set a texture stage samples, given what the mesh actually carries.
+
+    Returns -1 when the mesh carries no UVs at all.
+    """
+    occupied = [i for i, d in enumerate(t_verts_defs[:4]) if d.nb_used_entries > 0]
+    if not occupied:
+        return -1
+    return stage if stage in occupied else occupied[0]
+
+
+def material_stage_textures(material_params, fallback):
+    """The colour maps a material names, in texture-stage order."""
+    textures = (material_params or {}).get('textures') or {}
+    staged = []
+    for key, name in textures.items():
+        slot = DIFFUSE_TEXTURE_KEYS.get(key)
+        if slot is not None and name:
+            staged.append((slot, name))
+    if not staged:
+        return list(fallback or [])
+    staged.sort()
+    ordered = []
+    for _, name in staged:
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
+def is_double_sided(mesh_data):
+    """True when the node's shader draws the surface from both sides."""
+    return (mesh_data.get('shader_type') or '') in DOUBLE_SIDED_SHADERS
+
+
+def apply_backface_culling(mat, mesh_data):
+    """Cull back faces unless the shader says the surface is two-sided."""
+    mat.use_backface_culling = not is_double_sided(mesh_data)
+
+
+def build_additive_output(nodes, links, colour, strength, location=(100, 0)):
+    """Wire a colour and a strength into an additive surface."""
+    emission = nodes.new('ShaderNodeEmission')
+    emission.location = (location[0] - 250, location[1])
+    links.new(colour, emission.inputs['Color'])
+    if strength is not None:
+        links.new(strength, emission.inputs['Strength'])
+
+    transparent = nodes.new('ShaderNodeBsdfTransparent')
+    transparent.location = (location[0] - 250, location[1] - 200)
+
+    add = nodes.new('ShaderNodeAddShader')
+    add.location = location
+    links.new(emission.outputs['Emission'], add.inputs[0])
+    links.new(transparent.outputs['BSDF'], add.inputs[1])
+
+    output = nodes.new('ShaderNodeOutputMaterial')
+    output.location = (location[0] + 200, location[1])
+    links.new(add.outputs['Shader'], output.inputs['Surface'])
+    return emission
+
+
+# Shaders that draw light onto a surface rather than the surface itself.
+CAUSTIC_SHADERS = frozenset(("caustic",))
+
+# Shaders whose name says the surface is a mirror. Their nodes also set the
+# needsReflection flag and carry a reflection plane, which is how the game knows
+# to render the scene again into them.
+MIRROR_SHADERS = frozenset(("reflection", "reflection_b", "simple_refl"))
+
+# The file says "mirror" and nothing more, so a polished dielectric is as far as
+# the data goes.
+MIRROR_ROUGHNESS = 0.12
+MIRROR_SPECULAR = 0.5
+# How far from its plane a reflection probe reaches. Enough to cover a floor
+# that is not perfectly flat, short enough not to claim what stands on it.
+REFLECTION_PROBE_INFLUENCE = 1.0
+
+
+def is_mirror_surface(mesh_data):
+    """True when the file marks a node as a mirror the game re-renders into."""
+    return (bool(mesh_data.get('needs_reflection'))
+            and (mesh_data.get('shader_type') or '') in MIRROR_SHADERS)
+
+
+def create_reflection_probe(obj, mesh_data):
+    """Give a mirror surface the planar reflection probe EEVEE needs."""
+    # The mesh's own surface is the plane; the stored normal is the fallback for
+    # degenerate meshes.
+    world_normal = Vector()
+    for poly in obj.data.polygons:
+        world_normal += poly.normal
+    if world_normal.length < 1e-6:
+        world_normal = Vector(mesh_data.get('reflection_plane_normal') or (0.0, 0.0, 1.0))
+    world_normal = obj.matrix_world.to_3x3() @ world_normal
+    if world_normal.length < 1e-6:
+        return None
+    world_normal.normalize()
+
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    centre = sum(corners, Vector()) / len(corners)
+    extent = max((c - centre).length for c in corners)
+
+    probe_data = bpy.data.lightprobes.new(name=f"Reflection_{obj.name}", type='PLANE')
+    probe_data.influence_distance = REFLECTION_PROBE_INFLUENCE
+    probe = bpy.data.objects.new(f"Reflection_{obj.name}", probe_data)
+    probe.location = centre
+    probe.rotation_euler = world_normal.to_track_quat('Z', 'Y').to_euler()
+    probe.scale = (max(extent, 0.1), max(extent, 0.1), 1.0)
+    probe["tw1_node_type"] = "reflection_plane"
+    return probe
+
+
+def scroll_speeds(material_params, stage):
+    """The (u, v) speed of one of a material's texture matrices."""
+    floats = (material_params or {}).get('floats') or {}
+    u = floats.get(f"matrix_scroll_{stage}_speed_u", 0.0)
+    v = floats.get(f"matrix_scroll_{stage}_speed_v", 0.0)
+    return float(u), -float(v)
+
+
+def add_scroll_driver(mapping_node, speed_u, speed_v):
+    """Make a Mapping node's offset advance with the timeline."""
+    if not speed_u and not speed_v:
+        return
+    for index, speed in ((0, speed_u), (1, speed_v)):
+        if not speed:
+            continue
+        fcurve = mapping_node.inputs['Location'].driver_add('default_value', index)
+        driver = fcurve.driver
+        driver.type = 'SCRIPTED'
+        for name, path in (("fps", "render.fps"), ("fps_base", "render.fps_base")):
+            var = driver.variables.new()
+            var.name = name
+            var.type = 'SINGLE_PROP'
+            target = var.targets[0]
+            target.id_type = 'SCENE'
+            target.id = bpy.context.scene
+            target.data_path = path
+        driver.expression = (f"(frame - 1) * fps_base / fps * {speed:.6f}"
+                             " if fps else 0.0")
 
 # Texture search folders
 TEXTURE_FOLDERS = [
@@ -88,7 +632,7 @@ SKIP_NODE_PATTERNS = [
     "shadowbon", "shadowsword", # used by the game for the stencil shadows
     "door_coll_dummy",           # door collision mesh
     "Pyramid01", "clickable",    # collision for the bushes
-    "flarka", "sun_dummy", "cien", "blendbox", "woda_walkmesh", "Wm_woda"
+    "flarka", "sun_dummy", "cien", "blendbox", "woda_walkmesh", "Wm_woda", "fx_hitcheck03", "fx_hitcheck02", "fx_hitcheck01"
 ]
 
 TEXTURE_NAME_MAPPINGS = {
@@ -432,13 +976,6 @@ class MaterialParser:
             return self.textures["texture1"]
         return ""
     
-    def is_transparent(self):
-        transparent_shaders = [
-            "dblsided_atest", "leaves", "leaves_lm", 
-            "leaves_lm_bill", "leaves_singles", "transparency_2ps"
-        ]
-        return self.shader in transparent_shaders
-
 class BlendTextureParams:
     """Parser for blend_texture_params strings"""
     
@@ -549,6 +1086,9 @@ class MDBImporter:
         self.speedtree_instances = []
         self.speedtree_types = set()
         
+        # Names this model asks for that resolve to nothing, reported once.
+        self.unresolved_textures = set()
+
         self.bones = {}
         self.bone_list = []
         self.root_bones = []
@@ -601,7 +1141,8 @@ class MDBImporter:
         
         if tex_name in TEXTURE_NAME_MAPPINGS:
             mapped_name = TEXTURE_NAME_MAPPINGS[tex_name]
-            logger.log(f"  Mapping texture '{tex_name}' -> '{mapped_name}'")
+            logger.log(f"  '{tex_name}' is not in the game's files; substituting "
+                       f"'{mapped_name}'", force=True)
             return mapped_name
         
         return tex_name
@@ -685,10 +1226,56 @@ class MDBImporter:
         
         return shader_name
     
+    def read_uv_sets(self, t_verts_defs, vertex_count):
+        """Read a node's UV sets, each one left in the slot the file gave it."""
+        uv_sets = []
+        for uv_def in t_verts_defs[:4]:
+            if uv_def.nb_used_entries == 0:
+                uv_sets.append([])
+                continue
+            self.reader.seek(self.model_data.offset_raw_data + uv_def.first_elem_offset)
+            uvs = []
+            for _ in range(uv_def.nb_used_entries):
+                u = self.reader.read_f32()
+                v = self.reader.read_f32()
+                uvs.append((u, 1.0 - v))
+            while len(uvs) < vertex_count:
+                uvs.append((0.0, 0.0))
+            uv_sets.append(uvs)
+        while uv_sets and not uv_sets[-1]:
+            uv_sets.pop()
+        return uv_sets
+
+    def read_normals(self, normals_def, controllers):
+        """Read a per-vertex normal array.
+
+        Three signed 16-bit fixed-point components, scale 8192, six bytes per entry.
+        """
+        normals = []
+        if normals_def.nb_used_entries == 0:
+            return normals
+
+        rot = controllers.global_transform.to_3x3()
+        seek_pos = self.model_data.offset_raw_data + normals_def.first_elem_offset
+        self.reader.seek(seek_pos)
+
+        for i in range(normals_def.nb_used_entries):
+            x = self.reader.read_s16() / 8192.0
+            y = self.reader.read_s16() / 8192.0
+            z = self.reader.read_s16() / 8192.0
+            n = rot @ Vector((x, y, z))
+            if n.length > 1e-8:
+                n.normalize()
+            else:
+                n = Vector((0.0, 0.0, 1.0))
+            normals.append(n)
+
+        return normals
+
     def read_f32_array(self, offset, count):
         if count == 0:
             return []
-        
+
         pos = self.reader.tell()
         seek_pos = self.model_data.offset_model_data + offset
         self.reader.seek(seek_pos)
@@ -924,43 +1511,22 @@ class MDBImporter:
                 break
         
         for line in texture_lines:
-            if line.startswith("shader "):
+            parts = line.split(None, 2)
+            if len(parts) < 3 or parts[0] != "texture":
                 continue
-                
-            s = -1
-            n = 0
-            
-            if line.startswith("texture texture0 "):
-                s = 17
-                n = 0 if not has_shader_tex else 1
-                logger.log(f"  Found texture0 at index {n}")
-            elif line.startswith("texture texture1 "):
-                s = 17
-                n = 1 if not has_shader_tex else 2
-                logger.log(f"  Found texture1 at index {n}")
-            elif line.startswith("texture texture2 "):
-                s = 17
-                n = 2 if not has_shader_tex else 3
-                logger.log(f"  Found texture2 at index {n}")
-            elif line.startswith("texture texture3 "):
-                s = 17
-                n = 3 if not has_shader_tex else 4
-                logger.log(f"  Found texture3 at index {n}")
-            elif line.startswith("texture tex "):
-                s = 12
-                n = 0 if not has_shader_tex else 1
-                logger.log(f"  Found tex at index {n}")
-            elif line.startswith("texture texture_layer0 "):
-                s = 23
-                n = 0 if not has_shader_tex else 1
-                logger.log(f"  Found texture_layer0 at index {n}")
-                
-            if s != -1:
-                tex_name = line[s:].strip()
-                while len(textures) <= n:
-                    textures.append("")
-                textures[n] = tex_name
-        
+
+            slot = DIFFUSE_TEXTURE_KEYS.get(parts[1])
+            if slot is None:
+                logger.log(f"  Ignoring non-diffuse texture '{parts[1]}'")
+                continue
+
+            n = slot + 1 if has_shader_tex else slot
+            tex_name = parts[2].strip()
+            logger.log(f"  Found {parts[1]} at index {n}: {tex_name}")
+            while len(textures) <= n:
+                textures.append("")
+            textures[n] = tex_name
+
         if blend_params and blend_params.has_valid_entries() and not textures:
             blend_texture = blend_params.get_texture_for_time(self.time_of_day)
             if blend_texture:
@@ -1044,7 +1610,12 @@ class MDBImporter:
         if light_data.get('radius', 0) > 0:
             light_data_bl.shadow_soft_size = (light_data['radius'])/10
 
+        # The game's lights illuminate but are never drawn, and a Blender lamp with a
+        # radius is a glowing sphere - a white orb on the mirror floors.
+        light_data_bl.specular_factor = 0.0
         light_obj = bpy.data.objects.new(name=node_name, object_data=light_data_bl)
+        if hasattr(light_obj, 'visible_glossy'):
+            light_obj.visible_glossy = False
         light_obj.location = light_data['position']
         
         collection.objects.link(light_obj)
@@ -1205,17 +1776,7 @@ class MDBImporter:
             vertices.append(v)
         
         # Read normals
-        normals = []
-        if normals_def.nb_used_entries > 0:
-            seek_pos = self.model_data.offset_raw_data + normals_def.first_elem_offset
-            self.reader.seek(seek_pos)
-            for i in range(normals_def.nb_used_entries):
-                x = self.reader.read_f32()
-                y = self.reader.read_f32()
-                z = self.reader.read_f32()
-                n = controllers.global_transform.to_3x3() @ Vector((x, y, z))
-                n.normalize()
-                normals.append(n)
+        normals = self.read_normals(normals_def, controllers)
         
         # Read embedded textures block
         embedded_textures = self.read_textures_block()
@@ -1286,11 +1847,24 @@ class MDBImporter:
         
         # First, check for material file reference
         material_file_uv_index = -1
+        material_params = None
         if len(texture_strings) > 0 and texture_strings[0] == "_shader_" and len(texture_strings) > 1 and texture_strings[1]:
-            material_file_uv_index = 1
+            # The material's name sits in slot 1, which says nothing about the UV set its
+            # textures sample.
+            material_file_uv_index = 1 if (len(t_verts_defs) > 1
+                                           and t_verts_defs[1].nb_used_entries > 0) else 0
             logger.log(f"  Material file reference: {texture_strings[1]} (UV index {material_file_uv_index})")
             mat_parser = self.load_material_file(texture_strings[1])
             if mat_parser and mat_parser.has_material():
+                # Keep the whole material file, not just its diffuse: some shaders name several
+                # textures and the speeds their matrices scroll at.
+                material_params = {
+                    'name': texture_strings[1],
+                    'shader': mat_parser.shader,
+                    'textures': dict(mat_parser.textures),
+                    'floats': dict(mat_parser.floats),
+                    'uv_index': material_file_uv_index,
+                }
                 diffuse = mat_parser.get_diffuse_texture()
                 if diffuse:
                     textures_to_use.append(diffuse)
@@ -1300,7 +1874,8 @@ class MDBImporter:
         # If no material file, try embedded textures for diffuse
         if not textures_to_use:
             for i, tex in enumerate(embedded_textures):
-                if tex and i < len(t_verts_defs) and t_verts_defs[i].nb_used_entries > 0:
+                uv_slot = uv_slot_for(t_verts_defs, i) if tex else -1
+                if uv_slot >= 0:
                     mapped_tex = self.map_texture_name(tex)
                     if mapped_tex != tex:
                         tex = mapped_tex
@@ -1308,13 +1883,14 @@ class MDBImporter:
                     if lightmap_texture and (tex == light_map_name or tex == lightmap_texture):
                         continue
                     textures_to_use.append(tex)
-                    texture_uv_indices.append(i)
-                    logger.log(f"  Diffuse from embedded[{i}]: {tex}")
+                    texture_uv_indices.append(uv_slot)
+                    logger.log(f"  Diffuse from embedded[{i}]: {tex} (UV{uv_slot})")
         
         # Then try static textures from node for diffuse
         if not textures_to_use:
             for i, tex in enumerate(texture_strings):
-                if tex and tex != "NULL" and i < len(t_verts_defs) and t_verts_defs[i].nb_used_entries > 0:
+                uv_slot = uv_slot_for(t_verts_defs, i) if (tex and tex != "NULL") else -1
+                if uv_slot >= 0:
                     mapped_tex = self.map_texture_name(tex)
                     if mapped_tex != tex:
                         tex = mapped_tex
@@ -1323,8 +1899,8 @@ class MDBImporter:
                         continue
                     if tex not in textures_to_use:
                         textures_to_use.append(tex)
-                        texture_uv_indices.append(i)
-                        logger.log(f"  Diffuse from static[{i}]: {tex}")
+                        texture_uv_indices.append(uv_slot)
+                        logger.log(f"  Diffuse from static[{i}]: {tex} (UV{uv_slot})")
         
         # Now add the lightmap - as the first texture (index 0) so it becomes the top/overlay
         if lightmap_texture and lightmap_uv_index >= 0:
@@ -1339,6 +1915,7 @@ class MDBImporter:
                 valid_textures.append(tex)
                 valid_indices.append(texture_uv_indices[i])
             else:
+                self.unresolved_textures.add(tex)
                 logger.log(f"  Texture not found, skipping: {tex}")
         
         # If we still have no textures but have a lightmap, use just the lightmap
@@ -1350,23 +1927,8 @@ class MDBImporter:
         logger.log(f"  Final textures: {valid_textures}")
         logger.log(f"  UV indices: {valid_indices}")
         
-        uv_sets = []
-        for uv_idx in range(4):
-            if uv_idx < len(t_verts_defs) and t_verts_defs[uv_idx].nb_used_entries > 0:
-                uv_def = t_verts_defs[uv_idx]
-                seek_pos = self.model_data.offset_raw_data + uv_def.first_elem_offset
-                self.reader.seek(seek_pos)
-                uvs = []
-                for j in range(uv_def.nb_used_entries):
-                    u = self.reader.read_f32()
-                    v = self.reader.read_f32()
-                    uvs.append((u, 1.0 - v))
-                uv_sets.append(uvs)
-        
-        for i in range(len(uv_sets)):
-            while len(uv_sets[i]) < vertex_def.nb_used_entries:
-                uv_sets[i].append((0.0, 0.0))
-        
+        uv_sets = self.read_uv_sets(t_verts_defs, vertex_def.nb_used_entries)
+
         # Read faces
         indices = []
         seek_pos = self.model_data.offset_raw_data + faces_def.first_elem_offset
@@ -1405,8 +1967,19 @@ class MDBImporter:
             'uv_indices': valid_indices,
             'indices': indices,
             'textures': valid_textures,
+            # Which of those textures is the lightmap, by name. The material
+            # builder used to take the first one on faith, which only held
+            # because the lightmap happens to be inserted at the front.
+            'lightmap_texture': resolve_lightmap_name(lightmap_texture, light_map_name,
+                                                      valid_textures),
             'alpha': controllers.alpha if controllers.alpha < 1.0 else None,
             'is_transparent': is_transparent,
+            'transparency_hint': transparency_hint,
+            'render_pass': four_cc,
+            'material_params': material_params,
+            'needs_reflection': needs_reflection,
+            'reflection_plane_normal': reflection_plane_normal,
+            'reflection_plane_distance': reflection_plane_distance,
             'diffuse': diffuse,
             'ambient': ambient,
             'shininess': shininess,
@@ -1518,30 +2091,35 @@ class MDBImporter:
             v = controllers.global_transform @ Vector((x, y, z))
             vertices.append(v)
         
-        normals = []
-        if normals_def.nb_used_entries > 0:
-            seek_pos = self.model_data.offset_raw_data + normals_def.first_elem_offset
-            self.reader.seek(seek_pos)
-            for i in range(normals_def.nb_used_entries):
-                x = self.reader.read_f32()
-                y = self.reader.read_f32()
-                z = self.reader.read_f32()
-                n = controllers.global_transform.to_3x3() @ Vector((x, y, z))
-                n.normalize()
-                normals.append(n)
+        normals = self.read_normals(normals_def, controllers)
         
+        all_uv_sets = []
+        for uv_def in t_verts_defs:
+            uvs = []
+            if uv_def and uv_def.nb_used_entries > 0:
+                seek_pos = self.model_data.offset_raw_data + uv_def.first_elem_offset
+                self.reader.seek(seek_pos)
+                for i in range(uv_def.nb_used_entries):
+                    u = self.reader.read_f32()
+                    v = self.reader.read_f32()
+                    uvs.append((u, 1.0 - v))
+            all_uv_sets.append(uvs)
+
+        # Slot 0 is this node's place in the level's lightmap atlas, slot 1 the terrain's
+        # own tiled paint mapping.
+        lightmap_uvs = list(all_uv_sets[0]) if all_uv_sets else []
         base_uvs = []
-        uv_def = t_verts_defs[0] if len(t_verts_defs) > 0 else None
-        if uv_def and uv_def.nb_used_entries > 0:
-            seek_pos = self.model_data.offset_raw_data + uv_def.first_elem_offset
-            self.reader.seek(seek_pos)
-            for i in range(uv_def.nb_used_entries):
-                u = self.reader.read_f32()
-                v = self.reader.read_f32()
-                base_uvs.append((u, 1.0 - v))
+        for candidate in all_uv_sets[1:]:
+            if candidate:
+                base_uvs = list(candidate)
+                break
+        if not base_uvs:
+            base_uvs = list(lightmap_uvs)
         
         while len(base_uvs) < len(vertices):
             base_uvs.append((0.0, 0.0))
+        while len(lightmap_uvs) < len(vertices):
+            lightmap_uvs.append((0.0, 0.0))
         
         layers = []
         pos = self.reader.tell()
@@ -1553,7 +2131,7 @@ class MDBImporter:
             has_texture = self.reader.read_u8() == 1
             self.reader.seek(3, 1)
             self.reader.seek(4, 1)
-            
+
             texture_name = self.reader.read_string(32)
             if texture_name == "NULL":
                 texture_name = ""
@@ -1562,7 +2140,7 @@ class MDBImporter:
             
             logger.log(f"  Layer {layer_idx}: hasTexture={has_texture}, texture={texture_name}, weights={weights_def.nb_used_entries}")
             
-            if has_texture and texture_name and weights_def.nb_used_entries > 0:
+            if weights_def.nb_used_entries > 0:
                 weights = []
                 weights_pos = self.reader.tell()
                 weights_seek = self.model_data.offset_raw_data + weights_def.first_elem_offset
@@ -1576,7 +2154,10 @@ class MDBImporter:
                 
                 if texture_name == light_map_name and day_night_light_maps:
                     texture_name = self.evaluate_time_of_day_texture(texture_name, day_night_light_maps)
-                
+
+                if not has_texture:
+                    texture_name = ""
+
                 layers.append({
                     'texture': texture_name,
                     'weights': weights
@@ -1615,7 +2196,7 @@ class MDBImporter:
             'layers': layers,
             'indices': indices,
             'lightmap_texture': lightmap_texture,
-            'lightmap_uvs': base_uvs,
+            'lightmap_uvs': lightmap_uvs,
             'alpha': controllers.alpha if controllers.alpha < 1.0 else None,
             'is_transparent': False,
             'diffuse': diffuse,
@@ -1630,8 +2211,13 @@ class MDBImporter:
     
     def read_skin_node(self, controllers, bone_node=None):
         logger.log(f"Reading Skin node at {self.reader.tell()}")
-        
-        self.reader.seek(72 + 16 + 60, 1)
+
+        # A skin node opens with the same 148-byte header a trimesh node does,
+        # so the transparency hint sits at the same place and is worth reading
+        # rather than skipping: it is how the file says a mesh needs blending.
+        self.reader.seek(140, 1)
+        transparency_hint = self.reader.read_u32() == 1
+        self.reader.seek(4, 1)
         
         texture_strings = []
         for i in range(4):
@@ -1642,8 +2228,15 @@ class MDBImporter:
             if tex:
                 logger.log(f"  Skin texture {i}: {tex}")
         
-        self.reader.seek(61, 1)
-        
+        # Same 61-byte run a trimesh node has between its texture names and the
+        # day/night string, so the render list and the render-pass tag sit at
+        # the same offsets here too.
+        self.reader.seek(12, 1)
+        default_render_list = self.reader.read_u32()
+        self.reader.seek(4, 1)
+        four_cc = self.reader.read_u32()
+        self.reader.seek(37, 1)
+
         day_night_transition = self.reader.read_string(200)
         
         self.reader.seek(2 + 1 + 12 + 8, 1)
@@ -1729,17 +2322,7 @@ class MDBImporter:
             v = controllers.global_transform @ Vector((x, y, z))
             vertices.append(v)
         
-        normals = []
-        if normals_def.nb_used_entries > 0:
-            seek_pos = self.model_data.offset_raw_data + normals_def.first_elem_offset
-            self.reader.seek(seek_pos)
-            for i in range(normals_def.nb_used_entries):
-                x = self.reader.read_f32()
-                y = self.reader.read_f32()
-                z = self.reader.read_f32()
-                n = controllers.global_transform.to_3x3() @ Vector((x, y, z))
-                n.normalize()
-                normals.append(n)
+        normals = self.read_normals(normals_def, controllers)
         
         vertex_weights = []
         weight_index = 0
@@ -1814,6 +2397,7 @@ class MDBImporter:
         
         textures_to_use = []
         texture_uv_indices = []
+        lightmap_texture = None
         
         # First, check for material file reference
         if len(texture_strings) > 0 and texture_strings[0] == "_shader_" and len(texture_strings) > 1 and texture_strings[1]:
@@ -1830,21 +2414,21 @@ class MDBImporter:
                     if lightmap:
                         textures_to_use.append(lightmap)
                         texture_uv_indices.append(1)
+                        lightmap_texture = lightmap
         else:
             # Process embedded textures
             for i, tex in enumerate(embedded_textures):
                 if not tex:
                     continue
                 
-                uv_index = i + 1 if shader_consumes_slot else i
-                
-                # Check if this UV set actually has data
-                if uv_index < len(t_verts_defs) and t_verts_defs[uv_index].nb_used_entries > 0:
+                uv_index = uv_slot_for(t_verts_defs, i + 1 if shader_consumes_slot else i)
+                if uv_index >= 0:
                     if tex == light_map_name and self.time_of_day != 'NONE':
                         tex = self.evaluate_time_of_day_texture(tex, True)
                         if tex:
                             textures_to_use.append(tex)
                             texture_uv_indices.append(uv_index)
+                            lightmap_texture = tex
                             logger.log(f"  Lightmap from embedded[{i}] -> UV{uv_index}: {tex}")
                     elif tex:
                         textures_to_use.append(tex)
@@ -1859,14 +2443,14 @@ class MDBImporter:
                 if tex in textures_to_use:
                     continue
                 
-                uv_index = i + 1 if shader_consumes_slot else i
-                
-                if uv_index < len(t_verts_defs) and t_verts_defs[uv_index].nb_used_entries > 0:
+                uv_index = uv_slot_for(t_verts_defs, i + 1 if shader_consumes_slot else i)
+                if uv_index >= 0:
                     if tex == light_map_name and self.time_of_day != 'NONE':
                         tex = self.evaluate_time_of_day_texture(tex, True)
                         if tex and tex not in textures_to_use:
                             textures_to_use.append(tex)
                             texture_uv_indices.append(uv_index)
+                            lightmap_texture = tex
                             logger.log(f"  Lightmap from static[{i}] -> UV{uv_index}: {tex}")
                     elif tex and tex not in textures_to_use:
                         textures_to_use.append(tex)
@@ -1880,6 +2464,7 @@ class MDBImporter:
                 valid_textures.append(tex)
                 valid_indices.append(texture_uv_indices[i])
             else:
+                self.unresolved_textures.add(tex)
                 logger.log(f"  Texture not found, skipping: {tex}")
         
         # If no valid textures found, try fallback using first embedded texture
@@ -1894,25 +2479,8 @@ class MDBImporter:
         logger.log(f"  Skin final textures: {valid_textures}")
         logger.log(f"  UV indices: {valid_indices}")
         
-        # Read UV sets
-        uv_sets = []
-        for uv_idx in range(4):
-            if uv_idx < len(t_verts_defs) and t_verts_defs[uv_idx].nb_used_entries > 0:
-                uv_def = t_verts_defs[uv_idx]
-                seek_pos = self.model_data.offset_raw_data + uv_def.first_elem_offset
-                self.reader.seek(seek_pos)
-                uvs = []
-                for i in range(uv_def.nb_used_entries):
-                    u = self.reader.read_f32()
-                    v = self.reader.read_f32()
-                    uvs.append((u, 1.0 - v))
-                uv_sets.append(uvs)
-        
-        # Ensure all UV sets have correct length
-        for i in range(len(uv_sets)):
-            while len(uv_sets[i]) < vertex_def.nb_used_entries:
-                uv_sets[i].append((0.0, 0.0))
-        
+        uv_sets = self.read_uv_sets(t_verts_defs, vertex_def.nb_used_entries)
+
         # Read faces
         indices = []
         seek_pos = self.model_data.offset_raw_data + faces_def.first_elem_offset
@@ -1945,8 +2513,12 @@ class MDBImporter:
             'uv_indices': valid_indices,
             'indices': indices,
             'textures': valid_textures,
+            'lightmap_texture': resolve_lightmap_name(lightmap_texture, light_map_name,
+                                                      valid_textures),
             'alpha': controllers.alpha if controllers.alpha < 1.0 else None,
-            'is_transparent': controllers.alpha < 1.0,
+            'is_transparent': transparency_hint or controllers.alpha < 1.0,
+            'transparency_hint': transparency_hint,
+            'render_pass': four_cc,
             'node_name': '',
             'node_offset': 0,
             'node_number': 0,
@@ -2087,8 +2659,19 @@ class MDBImporter:
                     node_data = self.read_speedtree_node(controllers, node_name, node_number)
                 elif node_type == NODE_TYPE_LIGHT:
                     node_data = self.read_light_node(controllers, node_name, node_number)
-                
-                if node_data and node_type != NODE_TYPE_SPEEDTREE and node_type != NODE_TYPE_LIGHT:
+                elif node_type == NODE_TYPE_EMITTER:
+                    # Particle emitters carry no geometry this importer can
+                    # rebuild, but their placement is the useful part, so keep
+                    # the node itself.
+                    node_data = {
+                        'type': 'emitter',
+                        'node_name': node_name,
+                        'node_number': node_number,
+                        'matrix': controllers.global_transform.copy(),
+                    }
+
+                if node_data and node_type not in (NODE_TYPE_SPEEDTREE, NODE_TYPE_LIGHT,
+                                                   NODE_TYPE_EMITTER):
                     node_data['node_name'] = node_name
                     node_data['node_offset'] = node_pos
                     node_data['node_number'] = node_number
@@ -2742,28 +3325,48 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
     def execute(self, context):
         global logger
         logger.enabled = self.debug_mode
+        # Materials are shared across this import and no further; see
+        # _material_built_here.
+        _import_materials.clear()
         
         logger.log(f"\n{'='*60}", force=True)
         logger.log(f"Blender Witcher MDB Importer", force=True)
         logger.log(f"{'='*60}", force=True)
         
         importer = None
-        
+
         try:
+            model_path = self.filepath
+            composite = read_composite_model(self.filepath)
+            if composite:
+                resolved = find_sibling_model(self.filepath, composite.base_model)
+                if resolved is None:
+                    self.report({'ERROR'},
+                                f"'{os.path.basename(self.filepath)}' is a composite model "
+                                f"naming '{composite.base_model}', which is not beside it")
+                    return {'CANCELLED'}
+                logger.log(f"Composite model -> {composite.base_model} "
+                           f"({len(composite.animation_sets)} animation sets)", force=True)
+                model_path = resolved
+
             importer = MDBImporter(
-                self.filepath, 
-                self.game_path, 
+                model_path,
+                self.game_path,
                 self.time_of_day,
                 self.import_speedtrees,
                 self.import_skeletons,
                 self.debug_mode
             )
             node_data_list = importer.import_model()
-            
-            if not node_data_list and (not self.import_speedtrees or not importer.speedtree_instances):
-                self.report({'ERROR'}, "No meshes, lights, or trees found in file")
+            if node_data_list is None:
+                self.report({'ERROR'}, "Not a Witcher MDB file")
                 return {'CANCELLED'}
-            
+
+            has_trees = self.import_speedtrees and importer.speedtree_instances
+            if not node_data_list and not has_trees and not importer.bone_list:
+                self.report({'ERROR'}, "No meshes, lights, emitters or bones found in file")
+                return {'CANCELLED'}
+
             base_name = os.path.splitext(os.path.basename(self.filepath))[0]
             collection = bpy.data.collections.new(base_name)
             context.scene.collection.children.link(collection)
@@ -2781,7 +3384,9 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             imported_count = 0
             light_count = 0
             tree_instance_count = 0
+            emitter_count = 0
             
+            reflection_probes = []
             armature_obj = None
             if importer.bone_list:
                 logger.log(f"Creating armature with {len(importer.bone_list)} bones", force=True)
@@ -2808,12 +3413,32 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                     if obj:
                         collection.objects.link(obj)
                         imported_count += 1
+                        if is_mirror_surface(mesh_data):
+                            probe = create_reflection_probe(obj, mesh_data)
+                            if probe:
+                                collection.objects.link(probe)
+                                reflection_probes.append(probe)
                 
                 # Create lights
                 for light_data in light_data_list:
                     light_obj = importer.create_light_object(light_data, collection)
                     if light_obj:
                         light_count += 1
+
+                # Create emitters as empties - the effect itself cannot be
+                # rebuilt, but its position and name are worth keeping.
+                for emitter_data in [d for d in node_data_list if d.get('type') == 'emitter']:
+                    empty = bpy.data.objects.new(emitter_data['node_name'], None)
+                    empty.empty_display_type = 'SPHERE'
+                    empty.empty_display_size = 0.1
+                    empty.matrix_world = emitter_data['matrix']
+                    empty["tw1_node_type"] = "emitter"
+                    collection.objects.link(empty)
+                    if armature_obj and emitter_data['node_name'] in armature_obj.data.bones:
+                        empty.parent = armature_obj
+                        empty.parent_type = 'BONE'
+                        empty.parent_bone = emitter_data['node_name']
+                    emitter_count += 1
             
             if self.import_speedtrees and importer.speedtree_instances:
                 instances_collection_name = f"ST_Instances_{base_name}"
@@ -2833,7 +3458,40 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                 logger.log(f"Created {tree_instance_count} SpeedTree instances", force=True)
             if armature_obj:
                 logger.log(f"Created armature with {len(importer.bone_list)} bones", force=True)
-            self.report({'INFO'}, f"Imported {imported_count} meshes, {light_count} lights, {tree_instance_count} trees, {len(importer.bone_list)} bones")
+
+            if composite:
+                # Keep the pack list where the user (and the .mba importer) can
+                # find it; a composite model is mostly a pointer to these.
+                holder = armature_obj if armature_obj else collection
+                holder["tw1_base_model"] = composite.base_model
+                holder["tw1_animation_sets"] = composite.animation_sets
+                logger.log(f"Animation sets: {', '.join(composite.animation_sets)}", force=True)
+
+            if reflection_probes:
+                # A planar probe is dead weight in EEVEE unless raytracing is on.
+                eevee = getattr(context.scene, 'eevee', None)
+                if (eevee is not None and hasattr(eevee, 'use_raytracing')
+                        and not eevee.use_raytracing):
+                    eevee.use_raytracing = True
+                    logger.log("Enabled EEVEE raytracing for the reflection probes",
+                               force=True)
+
+            if importer.unresolved_textures:
+                # A mesh with no texture at all is the white one someone will
+                # ask about later, so say which name went looking for nothing.
+                names = ", ".join(sorted(importer.unresolved_textures))
+                logger.log(f"Textures named by this model but not in the game's "
+                           f"files: {names}", force=True)
+
+            summary = (f"Imported {imported_count} meshes, {light_count} lights, "
+                       f"{emitter_count} emitters, {tree_instance_count} trees, "
+                       f"{len(importer.bone_list)} bones")
+            if reflection_probes:
+                summary += f", {len(reflection_probes)} reflection planes"
+            if composite:
+                summary += (f" (composite of {composite.base_model}, "
+                            f"{len(composite.animation_sets)} animation sets)")
+            self.report({'INFO'}, summary)
             return {'FINISHED'}
         
         except Exception as e:
@@ -2853,7 +3511,7 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
         
         mat = bpy.data.materials.new(name=mat_name)
         mat.specular_intensity = 0.0
-        mat.use_backface_culling = True
+        apply_backface_culling(mat, mesh_data)
         mat.node_tree.nodes.clear()
         
         nodes = mat.node_tree.nodes
@@ -2976,12 +3634,21 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                 eb.parent = parent_eb
         
         bpy.ops.object.mode_set(mode='OBJECT')
-        
+
+        # Edit bones are shaped for readability, so their rest matrices do not match the
+        # node frames animations are authored against. Keep those for the .mba importer.
+        for bone_data in bones:
+            bone = armature_data.bones.get(bone_data.name)
+            if bone is None:
+                continue
+            bone[REST_LOCAL_PROP] = matrix_to_list(bone_data.local_matrix)
+            bone[REST_GLOBAL_PROP] = matrix_to_list(bone_data.global_matrix)
+
         armature_obj.hide_viewport = False
         armature_obj.hide_render = False
-        
+
         return armature_obj
-    
+
     def _create_mesh_object(self, name_prefix, mesh_data, importer, armature_obj=None):
         """Create a Blender mesh object with proper UV sets and skinning"""
         vertices = mesh_data['vertices']
@@ -3051,7 +3718,21 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                 # Verify that some vertices have weights
                 weighted_verts = sum(1 for w in mesh_data['skin_weights'] if w)
                 logger.log(f"    {weighted_verts}/{len(mesh_data['skin_weights'])} vertices have weights")
-            
+
+            elif armature_obj and node_name in armature_obj.data.bones:
+                # Rigid parts (eyes, teeth, weapons) are trimesh nodes rather than skins; bind
+                # them fully to the node they hang off so they follow the animation.
+                obj.parent = armature_obj
+
+                modifier = obj.modifiers.new(name="Armature", type='ARMATURE')
+                modifier.object = armature_obj
+                modifier.use_vertex_groups = True
+                modifier.use_bone_envelopes = False
+
+                vg = obj.vertex_groups.new(name=node_name)
+                vg.add(list(range(len(vertices))), 1.0, 'REPLACE')
+                logger.log(f"    Rigidly bound {obj_name} to bone '{node_name}'")
+
             # Add UV layers
             if mesh_data.get('is_texture_paint') and mesh_data.get('layers'):
                 if mesh_data.get('base_uvs') and len(mesh_data['base_uvs']) == len(vertices):
@@ -3068,39 +3749,49 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                             if loop.vertex_index < len(mesh_data['lightmap_uvs']):
                                 uv_layer2.data[i].uv = mesh_data['lightmap_uvs'][loop.vertex_index]
                 
-                valid_layers = [(i, layer) for i, layer in enumerate(mesh_data['layers']) 
-                               if layer.get('texture') and layer.get('weights') and 
-                               len(layer['weights']) == len(vertices) and
-                               importer.find_texture_file(layer['texture'])]
+                valid_layers = texture_paint_layers(mesh_data, importer)
                 
                 if valid_layers:
+                    layer_weights = [list(layer['weights']) for _, layer in valid_layers]
+                    filled = fill_unpainted_weights(mesh, layer_weights)
+                    if filled:
+                        logger.log(f"    Filled {filled} vertices left unpainted by a "
+                                   f"disabled layer")
+
                     for batch_idx in range(0, len(valid_layers), 3):
                         batch_layers = valid_layers[batch_idx:batch_idx + 3]
-                        
-                        vcol_layer = mesh.vertex_colors.new(name=f"Weights_{batch_idx // 3}")
-                        
+
+                        # FLOAT_COLOR, not a byte colour layer: byte colours are
+                        # treated as sRGB and would be gamma-converted on the way
+                        # into the shader, which silently skews every weight.
+                        name = f"Weights_{batch_idx // 3}"
+                        vcol_layer = mesh.color_attributes.new(
+                            name=name, type='FLOAT_COLOR', domain='CORNER')
+
                         if vcol_layer:
                             for loop in mesh.loops:
                                 vert_idx = loop.vertex_index
                                 rgb = [0.0, 0.0, 0.0, 1.0]
-                                
-                                for channel_idx, (orig_idx, layer) in enumerate(batch_layers):
-                                    if channel_idx < 3 and vert_idx < len(layer['weights']):
-                                        rgb[channel_idx] = layer['weights'][vert_idx]
-                                
+
+                                for channel_idx in range(len(batch_layers)):
+                                    weights = layer_weights[batch_idx + channel_idx]
+                                    if channel_idx < 3 and vert_idx < len(weights):
+                                        rgb[channel_idx] = weights[vert_idx]
+
                                 vcol_layer.data[loop.index].color = tuple(rgb)
-                            
-                            logger.log(f"    Created packed vertex color layer Weights_{batch_idx // 3} with {len(batch_layers)} layers")
+
+                            logger.log(f"    Created weight layer {name} with {len(batch_layers)} layers")
             
             elif 'uv_sets' in mesh_data and mesh_data['uv_sets']:
                 for uv_idx, uv_set in enumerate(mesh_data['uv_sets']):
                     if uv_idx >= 4:
                         break
-                    
-                    if len(uv_set) == len(vertices):
-                        uv_name = f"UVMap"
-                        if uv_idx > 0:
-                            uv_name = f"UVMap.{uv_idx}"
+
+                    # An empty slot makes no layer, but it still takes its
+                    # number: the layer names are what the materials look the
+                    # slots up by.
+                    if uv_set and len(uv_set) == len(vertices):
+                        uv_name = "UVMap" if uv_idx == 0 else f"UVMap.{uv_idx}"
                         
                         uv_layer = mesh.uv_layers.new(name=uv_name)
                         if uv_layer:
@@ -3108,13 +3799,27 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                                 if loop.vertex_index < len(uv_set):
                                     uv_layer.data[i].uv = uv_set[loop.vertex_index]
             
-            if mesh_data.get('normals') and len(mesh_data['normals']) == len(vertices):
+            # Shade smooth first: a sharp (flat) face overrides the custom split
+            # normals on its corners, so this has to happen before they are set.
+            for poly in mesh.polygons:
+                poly.use_smooth = True
+
+            normals = mesh_data.get('normals')
+            if normals and len(normals) == len(vertices):
                 try:
-                    mesh.use_auto_smooth = True
-                    mesh.normals_split_custom_set_from_vertices(mesh_data['normals'])
-                except:
-                    pass
-            
+                    # use_auto_smooth was removed in Blender 4.1; custom normals
+                    # are honoured unconditionally from then on.
+                    if hasattr(mesh, "use_auto_smooth"):
+                        mesh.use_auto_smooth = True
+                    mesh.normals_split_custom_set_from_vertices(normals)
+                except Exception as e:
+                    logger.error(f"  Failed to set custom normals: {e}")
+            elif normals:
+                logger.error(f"  Custom normals skipped: {len(normals)} normals for "
+                             f"{len(vertices)} vertices")
+            else:
+                logger.log(f"  No normals in file for {obj_name}")
+
             if mesh_data.get('is_texture_paint') and mesh_data.get('layers'):
                 mat = self._get_or_create_texture_paint_material(
                     mesh_data['layers'],
@@ -3132,9 +3837,9 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             
             if mat:
                 obj.data.materials.append(mat)
-            
-            for poly in obj.data.polygons:
-                poly.use_smooth = True
+                if mat.get(WEATHER_OVERLAY_PROP):
+                    obj.hide_render = True
+                    obj.hide_viewport = True
             
             logger.log(f"  Created object: {obj_name} with {len(vertices)} verts, {len(polygons)} faces")
             return obj
@@ -3144,25 +3849,68 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             traceback.print_exc()
             return None
 
+    def _material_built_here(self, mat_name, mesh_data):
+        """A material this import already built, if there is one."""
+        mat = _import_materials.get(mat_name)
+        if mat is not None:
+            apply_backface_culling(mat, mesh_data)
+        return mat
+
+    def _remember_material(self, mat_name, mat):
+        if mat is not None:
+            _import_materials[mat_name] = mat
+        return mat
+
     def _get_or_create_material(self, textures, uv_indices, mesh_data, importer):
         # Check if this is a water material first
         shader_type = mesh_data.get('shader_type', '')
         water_params = mesh_data.get('water_params')
         
+        if shader_type in CAUSTIC_SHADERS:
+            params = mesh_data.get('material_params') or {}
+            mat_name = f"Caustic_{params.get('name') or shader_type}"
+            if self.time_of_day != 'NONE':
+                mat_name += f"_{self.time_of_day}"
+            mat = self._material_built_here(mat_name, mesh_data)
+            if mat is not None:
+                logger.log(f"  Using existing caustic material: {mat_name}")
+                return mat
+            logger.log(f"  Creating new caustic material: {mat_name}")
+            mat = self._create_caustic_material(mesh_data, importer, mat_name)
+            if mat is not None:
+                return self._remember_material(mat_name, mat)
+
+        if shader_type in ADDITIVE_SHADERS and textures:
+            staged = material_stage_textures(mesh_data.get('material_params'), textures)
+            mat_name = "Additive_" + "_".join(os.path.basename(t) for t in staged if t)
+            mat_name += f"_{shader_type}"
+            alpha = mesh_data.get('alpha')
+            if alpha is not None:
+                mat_name += f"_a{alpha:.2f}"
+            mat = self._material_built_here(mat_name, mesh_data)
+            if mat is not None:
+                logger.log(f"  Using existing additive material: {mat_name}")
+                return mat
+            logger.log(f"  Creating new additive material: {mat_name}")
+            mat = self._create_additive_material(textures, uv_indices, mesh_data,
+                                                 importer, mat_name)
+            if mat is not None:
+                return self._remember_material(mat_name, mat)
+
         if importer.is_water_shader(shader_type) and water_params is not None:
             mat_name = "WaterMaterial"
             if water_params:
                 if 'water_color' in water_params:
                     mat_name += f"_{water_params['water_color'][0]:.2f}"
             
-            if mat_name in bpy.data.materials:
+            mat = self._material_built_here(mat_name, mesh_data)
+            if mat is not None:
                 logger.log(f"  Using existing water material: {mat_name}")
-                mat = bpy.data.materials[mat_name]
-                mat.use_backface_culling = True
                 return mat
             
             logger.log(f"  Creating new water material: {mat_name}")
-            return self._create_water_material(mesh_data, importer, mat_name)
+            return self._remember_material(
+                mat_name, self._create_water_material(mesh_data, importer, mat_name))
         
         if not textures:
             mat_name = "DefaultMaterial"
@@ -3172,19 +3920,35 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                 tex_base = os.path.basename(tex) if tex else "none"
                 uv_parts.append(f"{tex_base}_UV{uv_idx}")
             mat_name = "_".join(uv_parts)
+
+        # Two nodes can share a texture and still want different materials, so the key
+        # carries how the material is built, not just what it samples.
+        alpha_mode = resolve_alpha_mode(mesh_data)
+        if shader_type:
+            mat_name += f"_{shader_type}"
+        if alpha_mode != ALPHA_CLIP:
+            mat_name += f"_{alpha_mode}"
+        if is_mirror_surface(mesh_data):
+            mat_name += "_mirror"
+        if window_glow_applies(mesh_data, self.time_of_day):
+            mat_name += f"_lit{self.time_of_day}"
+        # A mesh with no usable UVs cannot share a material with one that has
+        # them: the shared UV node would name a layer this mesh never got.
+        if not any(uvs and len(uvs) == len(mesh_data.get('vertices') or [])
+                   for uvs in (mesh_data.get('uv_sets') or [])):
+            mat_name += "_nouv"
         
-        if mat_name in bpy.data.materials:
+        mat = self._material_built_here(mat_name, mesh_data)
+        if mat is not None:
             logger.log(f"  Using existing material: {mat_name}")
-            mat = bpy.data.materials[mat_name]
-            mat.use_backface_culling = True
             return mat
         
         logger.log(f"  Creating new material: {mat_name}")
-        return self._create_material(textures, uv_indices, mesh_data, importer, mat_name)
+        return self._remember_material(
+            mat_name, self._create_material(textures, uv_indices, mesh_data, importer, mat_name))
 
     def _get_or_create_texture_paint_material(self, layers, lightmap_texture, mesh_data, importer):
-        valid_layers = [(i, layer) for i, layer in enumerate(layers) 
-                       if layer.get('texture') and importer.find_texture_file(layer['texture'])]
+        valid_layers = texture_paint_layers(mesh_data, importer)
         
         if not valid_layers:
             return None
@@ -3197,14 +3961,16 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             lightmap_name = os.path.basename(lightmap_texture)
             mat_name += f"_LM_{lightmap_name}_{self.time_of_day}"
         
-        if mat_name in bpy.data.materials:
+        mat = self._material_built_here(mat_name, mesh_data)
+        if mat is not None:
             logger.log(f"  Using existing texture paint material: {mat_name}")
-            mat = bpy.data.materials[mat_name]
-            mat.use_backface_culling = True
             return mat
         
         logger.log(f"  Creating new texture paint material: {mat_name}")
-        return self._create_texture_paint_material_packed(layers, lightmap_texture, mesh_data, importer, mat_name)
+        return self._remember_material(
+            mat_name,
+            self._create_texture_paint_material_packed(layers, lightmap_texture, mesh_data,
+                                                       importer, mat_name))
 
     def _create_material(self, textures, uv_indices, mesh_data, importer, mat_name=None):
         if not mat_name:
@@ -3212,7 +3978,7 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
         
         mat = bpy.data.materials.new(name=mat_name)
         mat.specular_intensity = 0.0
-        mat.use_backface_culling = True
+        apply_backface_culling(mat, mesh_data)
         
         mat.node_tree.nodes.clear()
         
@@ -3225,7 +3991,14 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
         bsdf = nodes.new('ShaderNodeBsdfPrincipled')
         bsdf.location = (600, 0)
         bsdf.inputs['Specular IOR Level'].default_value = 0.0
-        
+
+        # A mirror is the one case where the blanket "no specular" is wrong.
+        if is_mirror_surface(mesh_data):
+            bsdf.inputs['Specular IOR Level'].default_value = MIRROR_SPECULAR
+            bsdf.inputs['Roughness'].default_value = MIRROR_ROUGHNESS
+            mat.specular_intensity = MIRROR_SPECULAR
+            logger.log(f"  Reflective surface (shader '{mesh_data.get('shader_type')}')")
+
         links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
         
         alpha_value = mesh_data.get('alpha')
@@ -3233,32 +4006,30 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             alpha_value = 1.0
         else:
             try:
-                alpha_value = float(alpha_value)
+                alpha_value = min(max(float(alpha_value), 0.0), 1.0)
             except (TypeError, ValueError):
                 alpha_value = 1.0
         
-        # Determine if this material should skip alpha connection
-        # These shaders use alpha for illumination/specular/other things
-        skip_alpha_shaders = ["selfilum_b", "reflection_b", "specular", "skin_n_rim_ao_mh", "skin_n_rim_ao"]
-        skip_alpha = False
-
-        shader_type = mesh_data.get('shader_type', '')
-        if shader_type in skip_alpha_shaders:
-            skip_alpha = True
-            logger.log(f"  Material uses shader '{shader_type}' - skipping alpha connection")
-        
-        if mesh_data.get('is_transparent', False) or (alpha_value < 1.0 and not skip_alpha):
-            mat.blend_method = 'BLEND'
-            bsdf.inputs['Alpha'].default_value = alpha_value
+        alpha_mode = resolve_alpha_mode(mesh_data)
+        apply_alpha_mode(mat, bsdf, alpha_mode, alpha_value)
+        logger.log(f"  Alpha mode: {alpha_mode} (shader '{mesh_data.get('shader_type') or ''}')")
         
         if not textures:
-            mat.blend_method = 'BLEND'
+            apply_alpha_mode(mat, bsdf, ALPHA_BLEND, UNTEXTURED_MATERIAL_ALPHA)
             bsdf.inputs['Base Color'].default_value = (1.0, 1.0, 1.0, 1.0)
-            bsdf.inputs['Alpha'].default_value = DEFAULT_MATERIAL_ALPHA
             return mat
         
+        # Only slots the mesh actually filled get a UV node.
+        vertex_count = len(mesh_data.get('vertices') or [])
+        available_uvs = {i for i, uvs in enumerate(mesh_data.get('uv_sets') or [])
+                         if uvs and len(uvs) == vertex_count}
         uv_nodes = {}
         for uv_idx in set(uv_indices):
+            if available_uvs and uv_idx not in available_uvs:
+                logger.log(f"  Texture names UV{uv_idx}, which this mesh has no UVs for")
+                continue
+            if not available_uvs:
+                continue
             uv_name = "UVMap"
             if uv_idx > 0:
                 uv_name = f"UVMap.{uv_idx}"
@@ -3272,29 +4043,25 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
         diffuse_node = None
         lightmap_node = None
         normal_map_node = None
+        lightmap_name = mesh_data.get('lightmap_texture')
+        window_glow = window_glow_applies(mesh_data, self.time_of_day)
         
         # Look for normal map
         normal_map_texture = None
         normal_map_uv_idx = 0
         
+        # A normal map is found by pairing: X has one when X_n exists on disk. A name
+        # that merely ends in _n is not evidence of anything.
         for idx, tex_name in enumerate(textures):
-            if not tex_name:
+            if not tex_name or tex_name.endswith('_n'):
                 continue
-            
-            base_name = tex_name
-            if base_name.endswith('_n'):
-                normal_map_texture = base_name
+
+            normal_candidate = tex_name + '_n'
+            if importer.find_texture_file(normal_candidate):
+                normal_map_texture = normal_candidate
                 normal_map_uv_idx = uv_indices[idx] if idx < len(uv_indices) else 0
-                logger.log(f"  Found normal map from texture list: {normal_map_texture}")
+                logger.log(f"  Found matching normal map: {normal_candidate}")
                 break
-            
-            if '_n' not in base_name:
-                normal_candidate = base_name + '_n'
-                if importer.find_texture_file(normal_candidate):
-                    normal_map_texture = normal_candidate
-                    normal_map_uv_idx = uv_indices[idx] if idx < len(uv_indices) else 0
-                    logger.log(f"  Found matching normal map: {normal_candidate}")
-                    break
         
         # Process all textures
         for idx, tex_name in enumerate(textures):
@@ -3319,17 +4086,17 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                 img = bpy.data.images.load(tex_path)
                 tex_node.image = img
                 
-                # For special shaders, set alpha mode to NONE
-                if skip_alpha:
+                if (resolve_deferred_alpha_mode(alpha_mode, img, mesh_data) == ALPHA_OPAQUE
+                        and not window_glow):
+                    # Keep the mask out of the colour as well as out of coverage.
                     img.alpha_mode = 'NONE'
-                    logger.log(f"  Set alpha mode to NONE for {tex_name}")
                 
                 if uv_idx in uv_nodes:
                     links.new(uv_nodes[uv_idx].outputs['UV'], tex_node.inputs['Vector'])
                 
                 texture_nodes.append((idx, tex_node, uv_idx))
 
-                if len(texture_nodes) == 1 and len(textures) > 1:
+                if lightmap_name and tex_name == lightmap_name:
                     lightmap_node = tex_node
                 else:
                     diffuse_node = tex_node
@@ -3343,9 +4110,8 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             if normal_map_path:
                 logger.log(f"  Loading normal map: {normal_map_path}")
                 
-                if normal_map_uv_idx in uv_nodes:
-                    normal_uv_node = uv_nodes[normal_map_uv_idx]
-                else:
+                normal_uv_node = uv_nodes.get(normal_map_uv_idx)
+                if normal_uv_node is None and normal_map_uv_idx in available_uvs:
                     uv_name = "UVMap"
                     if normal_map_uv_idx > 0:
                         uv_name = f"UVMap.{normal_map_uv_idx}"
@@ -3363,7 +4129,8 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                     normal_tex_node.image = img
                     img.colorspace_settings.name = 'Non-Color'
                     
-                    links.new(normal_uv_node.outputs['UV'], normal_tex_node.inputs['Vector'])
+                    if normal_uv_node is not None:
+                        links.new(normal_uv_node.outputs['UV'], normal_tex_node.inputs['Vector'])
                     
                     normal_map_node = nodes.new('ShaderNodeNormalMap')
                     normal_map_node.location = (-300, -400)
@@ -3372,9 +4139,9 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                     
                     links.new(normal_tex_node.outputs['Color'], normal_map_node.inputs['Color'])
                     links.new(normal_map_node.outputs['Normal'], bsdf.inputs['Normal'])
-                    
+
                     logger.log(f"  Normal map connected successfully")
-                    
+
                 except Exception as e:
                     logger.log(f"  Failed to load normal map {normal_map_texture}: {e}")
         
@@ -3383,6 +4150,28 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             bsdf.inputs['Base Color'].default_value = (1.0, 1.0, 1.0, 1.0)
             return mat
         
+        # Every object here sits at the world origin, so Blender sorts the blended sky
+        # shells arbitrarily. Only the sun and moon need occluding.
+        if (render_pass_tag(mesh_data) == 'SKY_'
+                and (mesh_data.get('node_name') or '').startswith(CELESTIAL_NODE_PREFIX)
+                and hasattr(mat, 'surface_render_method')):
+            mat.surface_render_method = 'DITHERED'
+            logger.log("  Sky body: writes depth so the shells can occlude it")
+
+        # A node can be sorted into the transparent pass and still have nothing to blend.
+        if (alpha_mode == ALPHA_BLEND and alpha_value >= 1.0
+                and render_pass_tag(mesh_data) not in RENDER_PASS_EFFECT_LAYERS):
+            blendable = diffuse_node or lightmap_node
+            if blendable is not None and texture_alpha_is_trivial(blendable.image):
+                logger.log("  Transparent pass, but the texture has no alpha to blend")
+                alpha_mode = ALPHA_OPAQUE
+                apply_alpha_mode(mat, bsdf, alpha_mode, 1.0)
+                if (mesh_data.get('shader_type') or '') in WEATHER_CLOUD_SHADERS:
+                    # Not an opaque cloud: a weather overlay with no weather to
+                    # drive it. Keep the object, leave it out of the render.
+                    mat[WEATHER_OVERLAY_PROP] = True
+                    logger.log("  Weather layer would blank the sky; left hidden")
+
         # Check if we actually have a valid lightmap texture loaded
         has_lightmap = (lightmap_node is not None and 
                        self.time_of_day != 'NONE' and 
@@ -3409,33 +4198,268 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
                 links.new(brightness_contrast.outputs['Color'], multiply_node.inputs['Color2'])
                 links.new(multiply_node.outputs['Color'], bsdf.inputs['Base Color'])
                 
-                if not skip_alpha and diffuse_node.image and diffuse_node.image.channels == 4:
-                    links.new(diffuse_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+                link_texture_alpha(links, nodes, diffuse_node, bsdf, alpha_mode, alpha_value,
+                                   mesh_data)
             else:
                 links.new(lightmap_node.outputs['Color'], bsdf.inputs['Base Color'])
-                if not skip_alpha and lightmap_node.image and lightmap_node.image.channels == 4:
-                    links.new(lightmap_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+                link_texture_alpha(links, nodes, lightmap_node, bsdf, alpha_mode, alpha_value,
+                                   mesh_data)
         else:
             # No lightmap - simple diffuse connection
             logger.log(f"  No lightmap found, using simple diffuse connection")
             if diffuse_node:
                 links.new(diffuse_node.outputs['Color'], bsdf.inputs['Base Color'])
                 
-                if not skip_alpha and diffuse_node.image and diffuse_node.image.channels == 4:
-                    links.new(diffuse_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+                link_texture_alpha(links, nodes, diffuse_node, bsdf, alpha_mode, alpha_value,
+                                   mesh_data)
             elif texture_nodes:
                 # Use the first available texture
                 tex_node = texture_nodes[0][1]
                 links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
                 
-                if not skip_alpha and tex_node.image and tex_node.image.channels == 4:
-                    links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
-        
+                link_texture_alpha(links, nodes, tex_node, bsdf, alpha_mode, alpha_value,
+                                   mesh_data)
+
+        if window_glow:
+            pane_node = diffuse_node or (texture_nodes[0][1] if texture_nodes else None)
+            if pane_node is not None:
+                self._add_window_glow(mat, bsdf, pane_node)
+
+        return mat
+
+    def _add_window_glow(self, mat, bsdf, pane_node):
+        """Light a window's panes from inside."""
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        mask = nodes.new('ShaderNodeMath')
+        mask.location = (200, -400)
+        mask.operation = 'SUBTRACT'
+        mask.label = "Pane mask"
+        mask.inputs[0].default_value = 1.0
+        links.new(pane_node.outputs['Alpha'], mask.inputs[1])
+
+        strength = nodes.new('ShaderNodeMath')
+        strength.location = (380, -400)
+        strength.operation = 'MULTIPLY'
+        strength.label = "Lamp strength"
+        strength.inputs[1].default_value = WINDOW_GLOW_STRENGTH
+        links.new(mask.outputs['Value'], strength.inputs[0])
+
+        tint = nodes.new('ShaderNodeMixRGB')
+        tint.location = (380, -600)
+        tint.blend_type = 'MULTIPLY'
+        tint.label = "Lamplight"
+        tint.inputs['Fac'].default_value = 1.0
+        tint.inputs['Color2'].default_value = (*WINDOW_GLOW_COLOR, 1.0)
+        links.new(pane_node.outputs['Color'], tint.inputs['Color1'])
+
+        emission = nodes.new('ShaderNodeEmission')
+        emission.location = (600, -500)
+        links.new(tint.outputs['Color'], emission.inputs['Color'])
+        links.new(strength.outputs['Value'], emission.inputs['Strength'])
+
+        add = nodes.new('ShaderNodeAddShader')
+        add.location = (820, -200)
+        links.new(bsdf.outputs['BSDF'], add.inputs[0])
+        links.new(emission.outputs['Emission'], add.inputs[1])
+
+        output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+        if output is not None:
+            links.new(add.outputs['Shader'], output.inputs['Surface'])
+        logger.log("  Lit window panes from inside")
+
+    def _create_caustic_material(self, mesh_data, importer, mat_name):
+        """Build the caustic effect the game projects onto sewer and cave walls."""
+        params = mesh_data.get('material_params') or {}
+        textures = params.get('textures') or {}
+        uv_index = params.get('uv_index', 1)
+
+        tex_path = importer.find_texture_file(textures.get('tex', ''))
+        if not tex_path:
+            logger.log(f"  Caustic material has no '{textures.get('tex', '')}' texture, "
+                       f"falling back to a plain material")
+            return None
+
+        mat = bpy.data.materials.new(name=mat_name)
+        apply_backface_culling(mat, mesh_data)
+        mat.blend_method = 'BLEND'
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+        mat.node_tree.nodes.clear()
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        def uv_node_for(index, y):
+            node = nodes.new('ShaderNodeUVMap')
+            node.location = (-1100, y)
+            node.uv_map = "UVMap" if index <= 0 else f"UVMap.{index}"
+            return node
+
+        def scrolled_texture(path, label, stage, y, non_color):
+            uv = uv_node_for(uv_index, y)
+            mapping = nodes.new('ShaderNodeMapping')
+            mapping.location = (-900, y)
+            mapping.label = f"Scroll {stage}"
+            links.new(uv.outputs['UV'], mapping.inputs['Vector'])
+            add_scroll_driver(mapping, *scroll_speeds(params, stage))
+
+            tex = nodes.new('ShaderNodeTexImage')
+            tex.location = (-700, y)
+            tex.label = label
+            tex.image = bpy.data.images.load(path)
+            if non_color:
+                tex.image.colorspace_settings.name = 'Non-Color'
+            links.new(mapping.outputs['Vector'], tex.inputs['Vector'])
+            return tex
+
+        # Non-Color: the RGB is one flat tint and the game adds it to a gamma-space
+        # framebuffer as authored.
+        # Two scrolled copies of the same pattern, multiplied - the material's two
+        # texture matrices.
+        pattern = scrolled_texture(tex_path, os.path.basename(textures['tex']), 1, 200, True)
+        pattern2 = scrolled_texture(tex_path, os.path.basename(textures['tex']), 2, -60, True)
+
+        crossed = nodes.new('ShaderNodeMath')
+        crossed.location = (-450, 120)
+        crossed.operation = 'MULTIPLY'
+        crossed.label = "Layer 1 x Layer 2"
+        links.new(pattern.outputs['Alpha'], crossed.inputs[0])
+        links.new(pattern2.outputs['Alpha'], crossed.inputs[1])
+        strength = crossed.outputs['Value']
+
+        # The mask is a pure function of V - every row of it is one value - and
+        # it falls off over exactly the V range these meshes' UVs occupy. It is
+        # the height falloff away from the water, and it does not scroll.
+        mask_path = importer.find_texture_file(textures.get('mask', ''))
+        if mask_path:
+            mask_uv = uv_node_for(uv_index, -240)
+            mask = nodes.new('ShaderNodeTexImage')
+            mask.location = (-700, -240)
+            mask.label = f"Falloff: {os.path.basename(textures['mask'])}"
+            mask.image = bpy.data.images.load(mask_path)
+            mask.image.colorspace_settings.name = 'Non-Color'
+            links.new(mask_uv.outputs['UV'], mask.inputs['Vector'])
+
+            faded = nodes.new('ShaderNodeMath')
+            faded.location = (-300, 60)
+            faded.operation = 'MULTIPLY'
+            faded.label = "x Height Falloff"
+            links.new(crossed.outputs['Value'], faded.inputs[0])
+            links.new(mask.outputs['Alpha'], faded.inputs[1])
+            strength = faded.outputs['Value']
+
+        # Colour: the caustic's own tint, kept only where the level's caustic
+        # lightmap says the water light actually falls.
+        colour = pattern.outputs['Color']
+        # The caustic shader's own lightmap, not one of the level's time-of-day bakes.
+        lightmap_path = importer.find_texture_file(textures.get('lightmap', ''))
+        if lightmap_path:
+            lm_uv = uv_node_for(0, -400)
+            lightmap = nodes.new('ShaderNodeTexImage')
+            lightmap.location = (-700, -400)
+            lightmap.label = f"Caustic lightmap: {os.path.basename(textures['lightmap'])}"
+            lightmap.image = bpy.data.images.load(lightmap_path)
+            links.new(lm_uv.outputs['UV'], lightmap.inputs['Vector'])
+
+            tint = nodes.new('ShaderNodeMixRGB')
+            tint.location = (-450, -200)
+            tint.blend_type = 'MULTIPLY'
+            tint.label = "Apply Caustic Lightmap"
+            tint.inputs['Fac'].default_value = 1.0
+            links.new(pattern.outputs['Color'], tint.inputs['Color1'])
+            links.new(lightmap.outputs['Color'], tint.inputs['Color2'])
+            colour = tint.outputs['Color']
+
+        build_additive_output(nodes, links, colour, strength)
+        return mat
+
+    def _create_additive_material(self, textures, uv_indices, mesh_data, importer, mat_name):
+        """Build a surface the game adds to the scene rather than covering it."""
+        # Both stages sample the same UV set when the mesh carries only one, so
+        # the extra texture needs no coordinates of its own.
+        textures = material_stage_textures(mesh_data.get('material_params'), textures)
+        paths = [(tex, importer.find_texture_file(tex)) for tex in textures if tex]
+        paths = [(tex, path) for tex, path in paths if path]
+        if not paths:
+            return None
+
+        mat = bpy.data.materials.new(name=mat_name)
+        apply_backface_culling(mat, mesh_data)
+        mat.blend_method = 'BLEND'
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+        mat.node_tree.nodes.clear()
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        tex_nodes = []
+        for i, (tex, path) in enumerate(paths):
+            uv_idx = uv_indices[i] if i < len(uv_indices) else 0
+            uv_node = nodes.new('ShaderNodeUVMap')
+            uv_node.location = (-900, 200 - i * 300)
+            uv_node.uv_map = "UVMap" if uv_idx <= 0 else f"UVMap.{uv_idx}"
+
+            tex_node = nodes.new('ShaderNodeTexImage')
+            tex_node.location = (-700, 200 - i * 300)
+            tex_node.label = os.path.basename(tex)
+            tex_node.image = bpy.data.images.load(path)
+            links.new(uv_node.outputs['UV'], tex_node.inputs['Vector'])
+            tex_nodes.append(tex_node)
+
+        colour = tex_nodes[0].outputs['Color']
+        for i, extra in enumerate(tex_nodes[1:]):
+            mix = nodes.new('ShaderNodeMixRGB')
+            mix.location = (-450, 100 - i * 150)
+            mix.blend_type = 'MULTIPLY'
+            mix.label = "Stage %d" % (i + 2)
+            mix.inputs['Fac'].default_value = 1.0
+            links.new(colour, mix.inputs['Color1'])
+            links.new(extra.outputs['Color'], mix.inputs['Color2'])
+            colour = mix.outputs['Color']
+
+        # The stages' alphas multiply: the plume decides where the effect is, the detail
+        # sheet only what it looks like there.
+        strength = None
+        for i, tex_node in enumerate(tex_nodes):
+            if tex_node.image is None or tex_node.image.channels < 4:
+                continue
+            if strength is None:
+                strength = tex_node.outputs['Alpha']
+                continue
+            mul = nodes.new('ShaderNodeMath')
+            mul.location = (-450, -300 - i * 150)
+            mul.operation = 'MULTIPLY'
+            mul.label = "Stage alphas"
+            links.new(strength, mul.inputs[0])
+            links.new(tex_node.outputs['Alpha'], mul.inputs[1])
+            strength = mul.outputs['Value']
+
+        alpha_value = mesh_data.get('alpha')
+        if alpha_value is not None:
+            try:
+                alpha_value = min(max(float(alpha_value), 0.0), 1.0)
+            except (TypeError, ValueError):
+                alpha_value = 1.0
+        else:
+            alpha_value = 1.0
+
+        emission = build_additive_output(nodes, links, colour, strength)
+        if alpha_value < 1.0:
+            if strength is None:
+                emission.inputs['Strength'].default_value = alpha_value
+            else:
+                scale = nodes.new('ShaderNodeMath')
+                scale.location = (-450, -150)
+                scale.operation = 'MULTIPLY'
+                scale.label = "Node Alpha"
+                scale.inputs[1].default_value = alpha_value
+                links.new(strength, scale.inputs[0])
+                links.new(scale.outputs['Value'], emission.inputs['Strength'])
         return mat
 
     def _create_texture_paint_material_packed(self, layers, lightmap_texture, mesh_data, importer, mat_name=None):
-        valid_layers = [(i, layer) for i, layer in enumerate(layers) 
-                       if layer.get('texture') and importer.find_texture_file(layer['texture'])]
+        valid_layers = texture_paint_layers(mesh_data, importer)
         
         if not valid_layers:
             return None
@@ -3447,14 +4471,13 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             if lightmap_texture and self.time_of_day != 'NONE':
                 mat_name += f"_lm_{self.time_of_day}"
         
-        if mat_name in bpy.data.materials:
-            mat = bpy.data.materials[mat_name]
-            mat.use_backface_culling = True
+        mat = self._material_built_here(mat_name, mesh_data)
+        if mat is not None:
             return mat
         
         mat = bpy.data.materials.new(name=mat_name)
         mat.specular_intensity = 0.0
-        mat.use_backface_culling = True
+        apply_backface_culling(mat, mesh_data)
         
         mat.node_tree.nodes.clear()
         
@@ -3474,23 +4497,24 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
             alpha_value = 1.0
         else:
             try:
-                alpha_value = float(alpha_value)
+                alpha_value = min(max(float(alpha_value), 0.0), 1.0)
             except (TypeError, ValueError):
                 alpha_value = 1.0
         
-        if mesh_data.get('is_transparent', False) or alpha_value < 1.0:
-            mat.blend_method = 'BLEND'
-            bsdf.inputs['Alpha'].default_value = alpha_value
+        apply_alpha_mode(mat, bsdf, resolve_alpha_mode(mesh_data), alpha_value)
         
         uv_base = nodes.new('ShaderNodeUVMap')
         uv_base.location = (-2000, 400)
         uv_base.uv_map = "UVMap"
         uv_base.label = "Base UVs"
         
+        # The paint UV set already carries the terrain's own tiling, so it is
+        # used as-is. The identity Mapping node is kept purely as a handle for
+        # anyone who wants to retile a level by hand.
         mapping = nodes.new('ShaderNodeMapping')
         mapping.location = (-1700, 400)
         mapping.vector_type = 'POINT'
-        mapping.inputs['Scale'].default_value = (50.0, 50.0, 50.0)
+        mapping.label = "Paint Tiling"
         links.new(uv_base.outputs['UV'], mapping.inputs['Vector'])
         
         layer_batches = []
@@ -3554,29 +4578,77 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
         
         texture_weight_map.sort(key=lambda x: x[2])
         
+        # Splatting is a weighted sum and the file's weights already add to 1 per vertex.
+        # An ADD mix accumulates that sum; chained MIX nodes do not.
         current_output = None
+        weight_total = None
         current_x = -1000
-        
+
         for idx, (tex_node, weight_source, orig_idx) in enumerate(texture_weight_map):
-            if idx == 0:
-                current_output = tex_node.outputs['Color']
-                continue
-            
             mix_node = nodes.new('ShaderNodeMixRGB')
             mix_node.location = (current_x, 0)
-            mix_node.blend_type = 'MIX'
-            mix_node.label = f"Mix Layer {orig_idx}"
-            
+            mix_node.blend_type = 'ADD'
+            mix_node.label = f"+ Layer {orig_idx}"
+
             if current_output:
                 links.new(current_output, mix_node.inputs['Color1'])
             else:
                 mix_node.inputs['Color1'].default_value = (0.0, 0.0, 0.0, 1.0)
-            
+
             links.new(tex_node.outputs['Color'], mix_node.inputs['Color2'])
             links.new(weight_source, mix_node.inputs['Fac'])
-            
+
             current_output = mix_node.outputs['Color']
+
+            # Run the same sum over the weights themselves, to divide by below.
+            if weight_total is None:
+                weight_total = weight_source
+            else:
+                add = nodes.new('ShaderNodeMath')
+                add.operation = 'ADD'
+                add.location = (current_x, -560)
+                add.label = f"Weight sum {orig_idx}"
+                links.new(weight_total, add.inputs[0])
+                links.new(weight_source, add.inputs[1])
+                weight_total = add.outputs['Value']
+
             current_x += 300
+
+        # Blank layers carry weight too, so normalise by the weight actually summed.
+        #
+        if current_output is not None and weight_total is not None:
+            safe_total = nodes.new('ShaderNodeMath')
+            safe_total.operation = 'MAXIMUM'
+            safe_total.location = (current_x, -560)
+            safe_total.label = "Avoid divide by zero"
+            safe_total.inputs[1].default_value = 1e-3
+            links.new(weight_total, safe_total.inputs[0])
+
+            normalize = nodes.new('ShaderNodeVectorMath')
+            normalize.operation = 'DIVIDE'
+            normalize.location = (current_x + 200, -200)
+            normalize.label = "Normalise by painted weight"
+            links.new(current_output, normalize.inputs[0])
+            links.new(safe_total.outputs['Value'], normalize.inputs[1])
+
+            painted = nodes.new('ShaderNodeMath')
+            painted.operation = 'MULTIPLY'
+            painted.location = (current_x + 200, -560)
+            painted.label = "Is anything painted?"
+            painted.inputs[1].default_value = 20.0
+            painted.use_clamp = True
+            links.new(weight_total, painted.inputs[0])
+
+            fallback = nodes.new('ShaderNodeMixRGB')
+            fallback.blend_type = 'MIX'
+            fallback.location = (current_x + 450, 0)
+            fallback.label = "Unpainted -> first layer"
+            links.new(texture_weight_map[0][0].outputs['Color'], fallback.inputs['Color1'])
+            links.new(normalize.outputs['Vector'], fallback.inputs['Color2'])
+            links.new(painted.outputs['Value'], fallback.inputs['Fac'])
+
+            current_output = fallback.outputs['Color']
+            current_x += 700
         
         # Check if we actually have a valid lightmap
         has_lightmap = False
@@ -3640,16 +4712,787 @@ class IMPORT_MDB_OT_operator(Operator, ImportHelper):
         
         return mat
 
+# ---------------------------------------------------------------------------
+# .mba animation import
+# ---------------------------------------------------------------------------
+
+class MBAAnimation:
+    """One animation entry inside a .mba pack."""
+
+    def __init__(self):
+        self.name = ""
+        self.length = 0.0
+        self.transition_time = 0.0
+        self.root_name = ""
+        self.root_node_offset = 0
+
+
+class MBAImporter:
+    """Reads a .mba animation pack."""
+
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.reader = BinaryReader(filepath)
+        self.model_data = ModelData()
+        self.model_name = ""
+        self.animations = []
+
+    def close(self):
+        if self.reader:
+            self.reader.close()
+            self.reader = None
+
+    def read_header(self):
+        if self.reader.read_u8() != 0:
+            raise ValueError("Not a binary Witcher .mba file")
+
+        self.reader.seek(4)
+        version = self.reader.read_u32() & 0x0FFFFFFF
+        self.model_data.file_version = version
+        if version not in (FILE_VERSION_133, FILE_VERSION_136):
+            raise ValueError(f"Unsupported .mba version: {version}")
+
+        model_count = self.reader.read_u32()
+        if model_count != 1:
+            raise ValueError(f"Unsupported model count: {model_count}")
+
+        self.reader.seek(4, 1)
+        self.model_data.size_model_data = self.reader.read_u32()
+        self.reader.seek(4, 1)
+        self.model_data.offset_model_data = 32
+
+        if version == FILE_VERSION_133:
+            self.model_data.offset_raw_data = self.reader.read_u32() + 32
+            self.model_data.size_raw_data = self.reader.read_u32()
+            self.model_data.offset_tex_data = 32
+        else:
+            self.model_data.offset_raw_data = 32
+            self.model_data.offset_tex_data = self.reader.read_u32() + 32
+            self.model_data.size_tex_data = self.reader.read_u32()
+
+        self.reader.seek(8, 1)
+        self.model_name = self.reader.read_string(64)
+        logger.log(f"Animation pack: {self.model_name} (version {version})", force=True)
+
+    def read_animation_list(self):
+        if self.model_data.file_version == FILE_VERSION_133:
+            chunk_start = self.model_data.offset_raw_data
+        else:
+            chunk_start = self.model_data.offset_tex_data
+
+        self.reader.seek(chunk_start)
+        self.reader.seek(4, 1)
+        anim_array = ArrayDef.read(self.reader)
+
+        self.reader.seek(chunk_start + anim_array.first_elem_offset)
+        offsets = [self.reader.read_u32() for _ in range(anim_array.nb_used_entries)]
+
+        self.animations = []
+        for offset in offsets:
+            self.reader.seek(self.model_data.offset_model_data + offset)
+
+            # Geometry header
+            self.reader.seek(8, 1)
+            name = self.reader.read_string(64)
+            root_node_offset = self.reader.read_u32()
+            self.reader.seek(32, 1)
+            self.reader.seek(4, 1)          # geometry type + padding
+
+            # Animation header
+            animation = MBAAnimation()
+            animation.name = name
+            animation.root_node_offset = root_node_offset
+            animation.length = self.reader.read_f32()
+            animation.transition_time = self.reader.read_f32()
+            animation.root_name = self.reader.read_string(64)
+            self.animations.append(animation)
+
+        logger.log(f"Found {len(self.animations)} animations", force=True)
+        return self.animations
+
+    def _read_u32_array(self, array_def):
+        if array_def.nb_used_entries == 0:
+            return []
+        pos = self.reader.tell()
+        self.reader.seek(self.model_data.offset_model_data + array_def.first_elem_offset)
+        values = [self.reader.read_u32() for _ in range(array_def.nb_used_entries)]
+        self.reader.seek(pos)
+        return values
+
+    def _read_f32_array(self, array_def):
+        if array_def.nb_used_entries == 0:
+            return []
+        pos = self.reader.tell()
+        self.reader.seek(self.model_data.offset_model_data + array_def.first_elem_offset)
+        values = [self.reader.read_f32() for _ in range(array_def.nb_used_entries)]
+        self.reader.seek(pos)
+        return values
+
+    def read_animation_nodes(self, animation):
+        """Read one animation's node tree.
+
+        Returns ({node_name: {channel: (times, values)}}, {node_name: parent}).
+        """
+        nodes = {}
+        parents = {}
+        self._read_animation_node(animation.root_node_offset, nodes, parents,
+                                  None, animation)
+        return nodes, parents
+
+    def _read_animation_node(self, node_offset, nodes, parents, parent_name,
+                             animation):
+        self.reader.seek(self.model_data.offset_model_data + node_offset)
+
+        self.reader.seek(24, 1)             # function pointers
+        self.reader.seek(4, 1)              # inherit colour flag
+        self.reader.read_u32()              # node id
+        node_name = self.reader.read_string(64)
+        self.reader.seek(8, 1)              # parent geometry + parent node
+
+        children_def = ArrayDef.read(self.reader)
+        children = self._read_u32_array(children_def)
+
+        key_def = ArrayDef.read(self.reader)
+        data_def = ArrayDef.read(self.reader)
+        data = self._read_f32_array(data_def)
+
+        channels = self._read_channels(key_def, data, node_name, animation)
+        named = bool(node_name) and node_name != "NULL"
+        if named:
+            parents[node_name] = parent_name
+            if channels:
+                nodes[node_name] = channels
+
+        for child_offset in children:
+            self._read_animation_node(child_offset, nodes, parents,
+                                      node_name if named else parent_name,
+                                      animation)
+
+    def _read_channels(self, key_def, data, node_name, animation):
+        channels = {}
+        if key_def.nb_used_entries == 0:
+            return channels
+
+        self.reader.seek(self.model_data.offset_model_data + key_def.first_elem_offset)
+        headers = []
+        for _ in range(key_def.nb_used_entries):
+            controller_type = self.reader.read_u32()
+            row_count = self.reader.read_u16()
+            time_index = self.reader.read_u16()
+            data_index = self.reader.read_u16()
+            packed_columns = self.reader.read_u8()
+            self.reader.seek(1, 1)          # padding
+            column_count = packed_columns & CONTROLLER_COLUMN_MASK
+            row_stride = column_count * CONTROLLER_ROW_SETS.get(
+                packed_columns & ~CONTROLLER_COLUMN_MASK, 1)
+            headers.append((controller_type, row_count, time_index,
+                            data_index, column_count, row_stride))
+
+        # A value block may not run into the next block along: where it does, the file
+        # disagrees with itself.
+        block_starts = sorted({h[2] for h in headers} | {h[3] for h in headers})
+
+        for (controller_type, row_count, time_index, data_index,
+                column_count, row_stride) in headers:
+            if row_count == 0 or row_count == 0xFFFF or column_count == 0:
+                continue
+
+            last_value = data_index + row_count * row_stride
+            next_block = min([s for s in block_starts if s > data_index],
+                             default=len(data))
+            if (time_index + row_count > len(data) or last_value > len(data)
+                    or last_value > next_block):
+                logger.error(f"  {animation.name}/{node_name}: controller "
+                             f"{controller_type} runs past its data array, skipped")
+                continue
+
+            times = [data[time_index + j] for j in range(row_count)]
+
+            if controller_type == CONTROLLER_POSITION and column_count >= 3:
+                values = []
+                for j in range(row_count):
+                    base = data_index + j * row_stride
+                    values.append(Vector((data[base], data[base + 1], data[base + 2])))
+                channels['position'] = (times, values)
+
+            elif controller_type == CONTROLLER_ORIENTATION and column_count >= 4:
+                values = []
+                for j in range(row_count):
+                    base = data_index + j * row_stride
+                    # Stored xyzw, mathutils wants wxyz.
+                    values.append(Quaternion((data[base + 3], data[base],
+                                              data[base + 1], data[base + 2])))
+                channels['rotation'] = (times, values)
+
+            elif controller_type == CONTROLLER_SCALE:
+                values = []
+                for j in range(row_count):
+                    s = data[data_index + j * row_stride]
+                    values.append(Vector((s, s, s)))
+                channels['scale'] = (times, values)
+
+        return channels
+
+
+def _sample_segment(times, t):
+    """Return (index, blend) for sampling a key list at time t."""
+    count = len(times)
+    if count == 1 or t <= times[0]:
+        return 0, 0.0
+    if t >= times[-1]:
+        return count - 1, 0.0
+    i = bisect.bisect_right(times, t) - 1
+    i = min(max(i, 0), count - 2)
+    span = times[i + 1] - times[i]
+    if span <= 1e-9:
+        return i, 0.0
+    return i, (t - times[i]) / span
+
+
+def _sample_vector(channel, t, fallback):
+    if not channel:
+        return fallback
+    times, values = channel
+    i, blend = _sample_segment(times, t)
+    if blend == 0.0:
+        return values[i]
+    return values[i].lerp(values[i + 1], blend)
+
+
+def _sample_quaternion(channel, t, fallback):
+    if not channel:
+        return fallback
+    times, values = channel
+    i, blend = _sample_segment(times, t)
+    if blend == 0.0:
+        return values[i]
+    return values[i].slerp(values[i + 1], blend)
+
+
+def _bone_rest_frames(armature_obj):
+    """Per-bone constants that map node-space animation onto pose bones."""
+    frames = {}
+    for bone in armature_obj.data.bones:
+        rest_local = bone.get(REST_LOCAL_PROP)
+        rest_global = bone.get(REST_GLOBAL_PROP)
+        if rest_local is None or rest_global is None:
+            continue
+
+        local = list_to_matrix(list(rest_local))
+        global_matrix = list_to_matrix(list(rest_global))
+        change_of_basis = global_matrix.inverted() @ bone.matrix_local
+
+        frames[bone.name] = {
+            'rest_local': local,
+            'rest_local_inv': local.inverted(),
+            'basis': change_of_basis,
+            'basis_inv': change_of_basis.inverted(),
+            'rest_trs': local.decompose(),
+            # Where this bone's parent node sits, for walking a chain that runs
+            # off the top of the armature.
+            'parent_global': global_matrix @ local.inverted(),
+        }
+    return frames
+
+
+def _action_channels(action, armature_obj):
+    """Create the channel container of a fresh action, returning (bag, slot)."""
+    slot = action.slots.new(id_type='OBJECT', name=armature_obj.name)
+    layer = action.layers.new("Layer")
+    strip = layer.strips.new(type='KEYFRAME')
+    return strip.channelbag(slot, ensure=True), slot
+
+
+def _write_fcurve(channelbag, data_path, index, frames, values, group):
+    fcurve = channelbag.fcurves.new(data_path, index=index)
+    if group is not None:
+        try:
+            fcurve.group = group
+        except Exception:
+            pass
+    points = fcurve.keyframe_points
+    points.add(len(frames))
+    flat = []
+    for frame, value in zip(frames, values):
+        flat.append(frame)
+        flat.append(value)
+    points.foreach_set("co", flat)
+    for point in points:
+        point.interpolation = 'LINEAR'
+    fcurve.update()
+
+
+def _write_channel_set(channelbag, data_path, frames, values, size, group):
+    """Write one vector/quaternion channel, collapsing constant curves to one key."""
+    for index in range(size):
+        component = [v[index] for v in values]
+        first = component[0]
+        if all(abs(c - first) <= 1e-7 for c in component):
+            _write_fcurve(channelbag, data_path, index, frames[:1], component[:1], group)
+        else:
+            _write_fcurve(channelbag, data_path, index, frames, component, group)
+
+
+def _is_placement_root(bone, animated_names):
+    """True when no ancestor of this bone is animated too."""
+    parent = bone.parent
+    while parent is not None:
+        if parent.name in animated_names:
+            return False
+        parent = parent.parent
+    return True
+
+
+class _NodePoses:
+    """Evaluates an animation in both hierarchies at once."""
+
+    def __init__(self, armature_obj, nodes, parents, rest_frames):
+        self.bones = armature_obj.data.bones
+        self.nodes = nodes
+        self.rest_frames = rest_frames
+        self.effective = {}
+        self.parents = self._align_roots(parents, armature_obj)
+        self.reparented = self._find_reparented()
+        self._anim_cache = {}
+        self._model_cache = {}
+
+    def _align_roots(self, parents, armature_obj):
+        """Rename the pack's root to the armature's, so the trees start level."""
+        anim_roots = [n for n, p in parents.items() if p is None]
+        bone_roots = [b.name for b in self.bones if b.parent is None]
+        if len(anim_roots) != 1 or len(bone_roots) != 1:
+            return dict(parents)
+        anim_root, bone_root = anim_roots[0], bone_roots[0]
+        if anim_root == bone_root or anim_root in self.bones:
+            return dict(parents)
+        aligned = {(bone_root if n == anim_root else n):
+                   (bone_root if p == anim_root else p)
+                   for n, p in parents.items()}
+        if anim_root in self.nodes:
+            self.nodes[bone_root] = self.nodes.pop(anim_root)
+        return aligned
+
+    def _find_reparented(self):
+        """Bones whose parent in the pack is not their parent in the model."""
+        reparented = set()
+        for bone in self.bones:
+            if bone.name not in self.parents:
+                continue
+            # The pack may route through dummies the model has no bone for.
+            pack_parent = self.parents.get(bone.name)
+            while pack_parent is not None and pack_parent not in self.bones:
+                pack_parent = self.parents.get(pack_parent)
+            own_parent = bone.parent.name if bone.parent else None
+            if pack_parent != own_parent:
+                reparented.add(bone.name)
+        return reparented
+
+    def set_channels(self, bone_name, position, rotation, scale):
+        self.effective[bone_name] = (position, rotation, scale)
+
+    def node_local(self, name, t):
+        """A node's own transform at time t, local to its parent in the pack."""
+        frame = self.rest_frames.get(name)
+        channels = self.effective.get(name)
+        if channels is None:
+            if name in self.nodes:
+                channels = (self.nodes[name].get('position'),
+                            self.nodes[name].get('rotation'),
+                            self.nodes[name].get('scale'))
+            elif frame is not None:
+                return frame['rest_local']
+            else:
+                return Matrix.Identity(4)
+        if frame is not None:
+            rest = frame['rest_trs']
+        else:
+            rest = (Vector((0.0, 0.0, 0.0)), Quaternion(), Vector((1.0, 1.0, 1.0)))
+        position, rotation, scale = channels
+        return (Matrix.Translation(_sample_vector(position, t, rest[0]))
+                @ _sample_quaternion(rotation, t, rest[1]).to_matrix().to_4x4()
+                @ Matrix.Diagonal(_sample_vector(scale, t, rest[2])).to_4x4())
+
+    def _base(self, name):
+        frame = self.rest_frames.get(name)
+        return frame['parent_global'] if frame else Matrix.Identity(4)
+
+    def anim_global(self, name, t, depth=0):
+        """Where the node ends up, composed down the pack's own tree."""
+        key = (name, t)
+        cached = self._anim_cache.get(key)
+        if cached is not None:
+            return cached
+        matrix = self.node_local(name, t)
+        parent = self.parents.get(name)
+        if parent is not None and depth < 64:
+            matrix = self.anim_global(parent, t, depth + 1) @ matrix
+        else:
+            matrix = self._base(name) @ matrix
+        self._anim_cache[key] = matrix
+        return matrix
+
+    def model_local(self, name, t):
+        """The same transform, local to the parent the model gives the node."""
+        if name not in self.reparented:
+            return self.node_local(name, t)
+        bone = self.bones.get(name)
+        if bone is None:
+            return self.node_local(name, t)
+        if bone.parent is not None:
+            parent_global = self.model_global(bone.parent.name, t)
+        else:
+            parent_global = self._base(name)
+        return parent_global.inverted() @ self.anim_global(name, t)
+
+    def model_global(self, name, t, depth=0):
+        key = (name, t)
+        cached = self._model_cache.get(key)
+        if cached is not None:
+            return cached
+        matrix = self.model_local(name, t)
+        bone = self.bones.get(name)
+        if bone is not None and bone.parent is not None and depth < 64:
+            matrix = self.model_global(bone.parent.name, t, depth + 1) @ matrix
+        else:
+            matrix = self._base(name) @ matrix
+        self._model_cache[key] = matrix
+        return matrix
+
+
+def _animation_closes(nodes, length):
+    """True when the animation's last key repeats its first pose."""
+    if length <= 0.0:
+        return False
+    closed = False
+    for channels in nodes.values():
+        for kind, channel in channels.items():
+            times, values = channel
+            if len(times) < 2:
+                continue
+            if kind == 'rotation':
+                first = _sample_quaternion(channel, 0.0, values[0])
+                last = _sample_quaternion(channel, length, values[-1])
+                # A quaternion and its negation are the same orientation.
+                delta = min((first - last).magnitude, (first + last).magnitude)
+            else:
+                first = _sample_vector(channel, 0.0, values[0])
+                last = _sample_vector(channel, length, values[-1])
+                delta = (first - last).magnitude
+            if delta > ANIMATION_LOOP_TOLERANCE:
+                return False
+            closed = True
+    return closed
+
+
+def build_animation_action(armature_obj, nodes, parents, animation, rest_frames,
+                           fps, action_name):
+    """Turn one parsed animation into a Blender action on armature_obj."""
+    action = bpy.data.actions.new(action_name)
+    channelbag, slot = _action_channels(action, armature_obj)
+
+    poses = _NodePoses(armature_obj, nodes, parents, rest_frames)
+    animated_names = set(nodes) & set(rest_frames)
+
+    # Resolve every node's channels before sampling any of them: a reparented
+    # node is placed against its parent's animated position, so the parent's own
+    # channels have to be settled first.
+    for bone_name, channels in nodes.items():
+        if bone_name not in rest_frames:
+            continue
+        position = channels.get('position')
+        # A reparented node keeps its stored position even when it never moves: it is a
+        # placement in the pack's frame, not a bone offset in the model's.
+        if (position and len(position[0]) < 2
+                and bone_name not in poses.reparented
+                and not _is_placement_root(armature_obj.data.bones[bone_name],
+                                           animated_names)):
+            position = None
+        poses.set_channels(bone_name, position, channels.get('rotation'),
+                           channels.get('scale'))
+
+    keyed_bones = 0
+    for bone_name, channels in nodes.items():
+        frame_data = rest_frames.get(bone_name)
+        if frame_data is None:
+            continue
+
+        position, rotation, scale = poses.effective[bone_name]
+
+        # A node may animate only some of its channels; the others keep the
+        # value the model's rest pose gave them.
+        rest_position, rest_rotation, rest_scale = frame_data['rest_trs']
+
+        sample_times = set()
+        for channel in (position, rotation, scale):
+            if channel:
+                sample_times.update(channel[0])
+        sample_times = sorted(sample_times)
+        if not sample_times:
+            continue
+
+        rest_local_inv = frame_data['rest_local_inv']
+        change_of_basis = frame_data['basis']
+        change_of_basis_inv = frame_data['basis_inv']
+
+        frames = []
+        locations = []
+        quaternions = []
+        scales = []
+        previous_quaternion = None
+
+        reparented = bone_name in poses.reparented
+        for t in sample_times:
+            if reparented:
+                local_anim = poses.model_local(bone_name, t)
+            else:
+                pos = _sample_vector(position, t, rest_position)
+                rot = _sample_quaternion(rotation, t, rest_rotation)
+                scl = _sample_vector(scale, t, rest_scale)
+                local_anim = (Matrix.Translation(pos) @ rot.to_matrix().to_4x4()
+                              @ Matrix.Diagonal(scl).to_4x4())
+            basis = change_of_basis_inv @ rest_local_inv @ local_anim @ change_of_basis
+
+            loc, quat, scl_out = basis.decompose()
+            # Keep successive quaternions in the same hemisphere so Blender's
+            # per-component interpolation takes the short way round.
+            if previous_quaternion is not None and quat.dot(previous_quaternion) < 0.0:
+                quat = -quat
+            previous_quaternion = quat
+
+            frame = 1.0 + t * fps
+            if abs(frame - round(frame)) < ANIMATION_FRAME_SNAP:
+                frame = float(round(frame))
+            frames.append(frame)
+            locations.append(loc)
+            quaternions.append(quat)
+            scales.append(scl_out)
+
+        try:
+            group = channelbag.groups.new(bone_name)
+        except Exception:
+            group = None
+
+        path = f'pose.bones["{bone_name}"]'
+        _write_channel_set(channelbag, path + '.location', frames, locations, 3, group)
+        _write_channel_set(channelbag, path + '.rotation_quaternion', frames,
+                           quaternions, 4, group)
+        _write_channel_set(channelbag, path + '.scale', frames, scales, 3, group)
+        keyed_bones += 1
+
+    action.use_fake_user = True
+    detail = ""
+    if poses.reparented:
+        detail = (f", {len(poses.reparented)} nodes the pack parents "
+                  f"differently from the model")
+    logger.log(f"  {animation.name}: {keyed_bones} bones, "
+               f"{animation.length:.2f}s{detail}")
+    return action, slot, keyed_bones
+
+
+class IMPORT_MBA_OT_operator(Operator, ImportHelper):
+    """Import a Witcher .mba animation pack onto an imported skeleton"""
+    bl_idname = "import_scene.mba"
+    bl_label = "Import Witcher Animation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".mba"
+    filter_glob: StringProperty(default="*.mba", options={'HIDDEN'})
+
+    armature_name: StringProperty(
+        name="Armature",
+        description="Armature to animate. Leave empty to use the active armature, "
+                    "or the only armature in the scene",
+        default="",
+    )
+
+    animation_filter: StringProperty(
+        name="Name Filter",
+        description="Only import animations whose name contains one of these "
+                    "comma-separated substrings. Leave empty to import all",
+        default="",
+    )
+
+    max_animations: IntProperty(
+        name="Max Animations",
+        description="Stop after this many animations (0 = no limit). A full pack "
+                    "can hold well over a hundred",
+        default=0,
+        min=0,
+    )
+
+    match_scene_frame_rate: BoolProperty(
+        name="Set Scene Frame Rate",
+        description="Set the scene to the 30 fps the packs are authored at, so "
+                    "the animation plays at the speed it was made for",
+        default=True,
+    )
+
+    assign_first: BoolProperty(
+        name="Assign First Animation",
+        description="Assign the first imported animation to the armature and set "
+                    "the scene frame range to match",
+        default=True,
+    )
+
+    push_to_nla: BoolProperty(
+        name="Push To NLA",
+        description="Store every imported animation as its own muted NLA track",
+        default=False,
+    )
+
+    debug_mode: BoolProperty(
+        name="Debug Mode",
+        description="Enable detailed logging",
+        default=False,
+    )
+
+    def _find_armature(self, context):
+        if self.armature_name:
+            obj = bpy.data.objects.get(self.armature_name)
+            if obj is None or obj.type != 'ARMATURE':
+                return None, f"No armature named '{self.armature_name}'"
+            return obj, None
+
+        active = context.view_layer.objects.active
+        if active is not None and active.type == 'ARMATURE':
+            return active, None
+
+        armatures = [o for o in context.scene.objects if o.type == 'ARMATURE']
+        if len(armatures) == 1:
+            return armatures[0], None
+        if not armatures:
+            return None, ("No armature in the scene - import a .mdb with "
+                          "'Import Skeletons' first")
+        return None, ("Several armatures in the scene - make one active or fill in "
+                      "the Armature field")
+
+    def execute(self, context):
+        global logger
+        logger.enabled = self.debug_mode
+
+        armature_obj, error = self._find_armature(context)
+        if armature_obj is None:
+            self.report({'ERROR'}, error)
+            return {'CANCELLED'}
+
+        rest_frames = _bone_rest_frames(armature_obj)
+        if not rest_frames:
+            self.report({'ERROR'},
+                        f"'{armature_obj.name}' carries no Witcher rest data on its "
+                        f"bones. Re-import the .mdb with 'Import Skeletons' enabled")
+            return {'CANCELLED'}
+
+        importer = None
+        try:
+            importer = MBAImporter(self.filepath)
+            importer.read_header()
+            animations = importer.read_animation_list()
+
+            wanted = [f.strip().lower()
+                      for f in self.animation_filter.split(",") if f.strip()]
+            if wanted:
+                animations = [a for a in animations
+                              if any(w in a.name.lower() for w in wanted)]
+            if self.max_animations:
+                animations = animations[:self.max_animations]
+
+            if not animations:
+                self.report({'ERROR'}, "No animations matched the name filter")
+                return {'CANCELLED'}
+
+            scene = context.scene
+            fps = ANIMATION_FPS
+            base_name = os.path.splitext(os.path.basename(self.filepath))[0]
+
+            if armature_obj.animation_data is None:
+                armature_obj.animation_data_create()
+
+            imported = []
+            skipped = []
+            worst_match = 1.0
+            for animation in animations:
+                nodes, parents = importer.read_animation_nodes(animation)
+                action, slot, keyed = build_animation_action(
+                    armature_obj, nodes, parents, animation, rest_frames, fps,
+                    f"{base_name}_{animation.name}")
+                if keyed == 0:
+                    skipped.append(animation.name)
+                    bpy.data.actions.remove(action)
+                    continue
+                if nodes:
+                    worst_match = min(worst_match, keyed / len(nodes))
+                imported.append((animation, action, slot,
+                                 _animation_closes(nodes, animation.length)))
+
+            if not imported:
+                self.report({'ERROR'},
+                            "No animation node matched a bone of "
+                            f"'{armature_obj.name}' - wrong skeleton for this pack?")
+                return {'CANCELLED'}
+
+            if self.match_scene_frame_rate:
+                scene.render.fps = int(round(ANIMATION_FPS))
+                scene.render.fps_base = 1.0
+
+            if self.push_to_nla:
+                for animation, action, slot, _closes in imported:
+                    track = armature_obj.animation_data.nla_tracks.new()
+                    track.name = action.name
+                    strip = track.strips.new(action.name, 1, action)
+                    strip.action_slot = slot
+                    track.mute = True
+
+            if self.assign_first:
+                animation, action, slot, closes = imported[0]
+                armature_obj.animation_data.action = action
+                armature_obj.animation_data.action_slot = slot
+                scene.frame_start = 1
+                last = int(round(1.0 + animation.length * fps))
+                # The closing key repeats the opening pose, so playing up to it
+                # would show that pose twice every time round.
+                scene.frame_end = max(2, last - 1 if closes else last)
+                scene.frame_set(scene.frame_start)
+
+            message = f"Imported {len(imported)} animations from {base_name}"
+            if skipped:
+                message += f" ({len(skipped)} matched no bones)"
+            # Bones are matched by name, so a pack built for another skeleton can
+            # still drive part of this one. Say so rather than looking clean.
+            level = 'INFO'
+            if worst_match < 0.9:
+                message += f", only {worst_match * 100:.0f}% of nodes matched a bone"
+                level = 'WARNING'
+            self.report({level}, message)
+            logger.log(message, force=True)
+            return {'FINISHED'}
+
+        except Exception as e:
+            logger.error(f"MBA import failed: {e}")
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Failed to import animation: {e}")
+            return {'CANCELLED'}
+        finally:
+            if importer:
+                importer.close()
+
+
 def menu_func_import(self, context):
     self.layout.operator(IMPORT_MDB_OT_operator.bl_idname, text="Witcher MDB (.mdb)")
 
+def menu_func_import_mba(self, context):
+    self.layout.operator(IMPORT_MBA_OT_operator.bl_idname, text="Witcher Animation (.mba)")
+
 def register():
     bpy.utils.register_class(IMPORT_MDB_OT_operator)
+    bpy.utils.register_class(IMPORT_MBA_OT_operator)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.TOPBAR_MT_file_import.append(menu_func_import_mba)
 
 def unregister():
-    bpy.utils.unregister_class(IMPORT_MDB_OT_operator)
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import_mba)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.utils.unregister_class(IMPORT_MBA_OT_operator)
+    bpy.utils.unregister_class(IMPORT_MDB_OT_operator)
 
 if __name__ == "__main__":
     register()
